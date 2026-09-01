@@ -8,10 +8,11 @@ review what's been filed so far across the whole scan.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from agents import RunContextWrapper, function_tool
@@ -147,6 +148,108 @@ def _calculate_cvss(breakdown: dict[str, str]) -> tuple[float, str, str]:
     return score, severity, vector
 
 
+_MAX_SCREENSHOTS = 6
+_MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
+# Magic-byte sniff for what agent-browser screenshot actually produces (PNG)
+# plus JPEG, in case a manually-saved capture is used instead.
+_SCREENSHOT_MAGIC: dict[bytes, str] = {
+    b"\x89PNG\r\n\x1a\n": "png",
+    b"\xff\xd8\xff": "jpg",
+}
+
+
+def _validate_screenshot_path(path: str) -> str | None:
+    if not path or not path.strip():
+        return "path cannot be empty"
+    p = PurePosixPath(path.strip())
+    if ".." in p.parts:
+        return f"path must not contain '..': '{path}'"
+    if p.is_absolute() and (len(p.parts) < 2 or p.parts[1] != "workspace"):
+        return f"path must be under /workspace, got: '{path}'"
+    return None
+
+
+def _normalize_screenshots(
+    raw: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Validate shape and path safety only -- no sandbox I/O here."""
+    if not raw:
+        return [], []
+    errors: list[str] = []
+    if len(raw) > _MAX_SCREENSHOTS:
+        errors.append(f"screenshots: at most {_MAX_SCREENSHOTS} allowed, got {len(raw)}")
+        raw = raw[:_MAX_SCREENSHOTS]
+    normalized: list[dict[str, str]] = []
+    for i, shot in enumerate(raw):
+        path = str(shot.get("path") or "").strip()
+        caption = str(shot.get("caption") or "").strip()
+        path_err = _validate_screenshot_path(path)
+        if path_err:
+            errors.append(f"screenshots[{i}]: {path_err}")
+            continue
+        if not caption:
+            errors.append(f"screenshots[{i}]: caption cannot be empty")
+            continue
+        normalized.append({"path": path, "caption": caption})
+    return normalized, errors
+
+
+def _sniff_image_extension(payload: bytes) -> str | None:
+    for magic, ext in _SCREENSHOT_MAGIC.items():
+        if payload.startswith(magic):
+            return ext
+    return None
+
+
+def _slugify_caption(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:40] or "screenshot"
+
+
+async def _fetch_screenshots(
+    sandbox_session: Any,
+    screenshots: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read each screenshot's bytes out of the sandbox.
+
+    Called only after dedupe has confirmed the report is new, so a duplicate
+    report never triggers this I/O. Any failure here fails the whole report
+    (matching the rest of this file's all-or-nothing validation) rather than
+    silently filing with partial evidence.
+    """
+    if not screenshots:
+        return [], []
+    if sandbox_session is None:
+        return [], ["screenshots: sandbox session unavailable, cannot read screenshot files"]
+
+    fetched: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for i, shot in enumerate(screenshots):
+        path = shot["path"]
+        try:
+            file_obj = await sandbox_session.read(Path(path))
+            try:
+                payload = file_obj.read(_MAX_SCREENSHOT_BYTES + 1)
+            finally:
+                with contextlib.suppress(Exception):
+                    file_obj.close()
+        except Exception as exc:  # noqa: BLE001 - any sandbox read failure is a report error
+            errors.append(f"screenshots[{i}]: could not read '{path}': {exc}")
+            continue
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        if len(payload) > _MAX_SCREENSHOT_BYTES:
+            errors.append(f"screenshots[{i}]: '{path}' exceeds the 10MB size limit")
+            continue
+        ext = _sniff_image_extension(payload)
+        if ext is None:
+            errors.append(f"screenshots[{i}]: '{path}' is not a recognized PNG/JPEG image")
+            continue
+        filename = f"{i + 1:02d}-{_slugify_caption(shot['caption'])}.{ext}"
+        fetched.append({"caption": shot["caption"], "filename": filename, "data": payload})
+    return fetched, errors
+
+
 _REQUIRED_FIELDS = {
     "title": "Title cannot be empty",
     "description": "Description cannot be empty",
@@ -163,7 +266,7 @@ _REQUIRED_FIELDS = {
 _VALID_FIX_EFFORT = frozenset({"trivial", "low", "medium", "high"})
 
 
-async def _do_create(  # noqa: PLR0912
+async def _do_create(  # noqa: PLR0911, PLR0912, PLR0915
     *,
     title: str,
     description: str,
@@ -185,6 +288,8 @@ async def _do_create(  # noqa: PLR0912
     fix_pr_body: str | None = None,
     agent_id: str | None = None,
     agent_name: str | None = None,
+    screenshots: list[dict[str, Any]] | None = None,
+    sandbox_session: Any = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     fields = {
@@ -221,6 +326,8 @@ async def _do_create(  # noqa: PLR0912
     parsed_locations = _normalize_code_locations(code_locations)
     if parsed_locations:
         errors.extend(_validate_code_locations(parsed_locations))
+    normalized_screenshots, screenshot_errors = _normalize_screenshots(screenshots)
+    errors.extend(screenshot_errors)
     if cve:
         cve = _extract_cve(cve)
         cve_err = _validate_cve(cve)
@@ -254,61 +361,74 @@ async def _do_create(  # noqa: PLR0912
 
         from strix.report.dedupe import check_duplicate
 
-        existing = report_state.get_existing_vulnerabilities()
-        candidate = {
-            "title": title,
-            "description": description,
-            "impact": impact,
-            "target": target,
-            "technical_analysis": technical_analysis,
-            "poc_description": poc_description,
-            "poc_script_code": poc_script_code,
-            "endpoint": endpoint,
-            "method": method,
-        }
-        dedupe = await check_duplicate(candidate, existing)
-        if dedupe.get("is_duplicate"):
-            duplicate_id = dedupe.get("duplicate_id", "")
-            duplicate_title = next(
-                (r.get("title", "Unknown") for r in existing if r.get("id") == duplicate_id),
-                "",
-            )
-            return {
-                "success": False,
-                "error": (
-                    f"Potential duplicate of '{duplicate_title}' "
-                    f"(id={duplicate_id[:8]}...) — do not re-report the same vulnerability"
-                ),
-                "duplicate_of": duplicate_id,
-                "duplicate_title": duplicate_title,
-                "confidence": dedupe.get("confidence", 0.0),
-                "reason": dedupe.get("reason", ""),
+        # Serialized scan-wide: check_duplicate awaits an LLM call, so without
+        # this lock two agents filing near-simultaneous reports for the same
+        # finding could both read the list before either insert lands, both
+        # get is_duplicate=False, and both get inserted. See dedupe_lock's
+        # docstring in ReportState.
+        async with report_state.dedupe_lock:
+            existing = report_state.get_existing_vulnerabilities()
+            candidate = {
+                "title": title,
+                "description": description,
+                "impact": impact,
+                "target": target,
+                "technical_analysis": technical_analysis,
+                "poc_description": poc_description,
+                "poc_script_code": poc_script_code,
+                "endpoint": endpoint,
+                "method": method,
             }
+            dedupe = await check_duplicate(candidate, existing)
+            if dedupe.get("is_duplicate"):
+                duplicate_id = dedupe.get("duplicate_id", "")
+                duplicate_title = next(
+                    (r.get("title", "Unknown") for r in existing if r.get("id") == duplicate_id),
+                    "",
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"Potential duplicate of '{duplicate_title}' "
+                        f"(id={duplicate_id[:8]}...) — do not re-report the same vulnerability"
+                    ),
+                    "duplicate_of": duplicate_id,
+                    "duplicate_title": duplicate_title,
+                    "confidence": dedupe.get("confidence", 0.0),
+                    "reason": dedupe.get("reason", ""),
+                }
 
-        report_id = report_state.add_vulnerability_report(
-            title=title,
-            description=description,
-            severity=severity,
-            impact=impact,
-            target=target,
-            technical_analysis=technical_analysis,
-            poc_description=poc_description,
-            poc_script_code=poc_script_code,
-            remediation_steps=remediation_steps,
-            evidence=evidence,
-            assumptions=assumptions,
-            fix_effort=fix_effort,
-            cvss=cvss_score,
-            cvss_breakdown=cvss_breakdown,
-            endpoint=endpoint,
-            method=method,
-            cve=cve,
-            cwe=cwe,
-            code_locations=parsed_locations,
-            fix_pr_body=fix_pr_body,
-            agent_id=agent_id if isinstance(agent_id, str) else None,
-            agent_name=agent_name if isinstance(agent_name, str) else None,
-        )
+            fetched_screenshots, fetch_errors = await _fetch_screenshots(
+                sandbox_session, normalized_screenshots
+            )
+            if fetch_errors:
+                return {"success": False, "error": "Validation failed", "errors": fetch_errors}
+
+            report_id = report_state.add_vulnerability_report(
+                title=title,
+                description=description,
+                severity=severity,
+                impact=impact,
+                target=target,
+                technical_analysis=technical_analysis,
+                poc_description=poc_description,
+                poc_script_code=poc_script_code,
+                remediation_steps=remediation_steps,
+                evidence=evidence,
+                assumptions=assumptions,
+                fix_effort=fix_effort,
+                cvss=cvss_score,
+                cvss_breakdown=cvss_breakdown,
+                endpoint=endpoint,
+                method=method,
+                cve=cve,
+                cwe=cwe,
+                code_locations=parsed_locations,
+                fix_pr_body=fix_pr_body,
+                screenshots=fetched_screenshots,
+                agent_id=agent_id if isinstance(agent_id, str) else None,
+                agent_name=agent_name if isinstance(agent_name, str) else None,
+            )
     except (ImportError, AttributeError) as e:
         logger.exception("create_vulnerability_report persistence failed")
         return {"success": False, "error": f"Failed to create vulnerability report: {e!s}"}
@@ -365,6 +485,7 @@ async def create_vulnerability_report(
     cwe: str | None = None,
     code_locations: list[dict[str, Any]] | None = None,
     fix_pr_body: str | None = None,
+    screenshots: list[dict[str, Any]] | None = None,
 ) -> str:
     """File a vulnerability report — one report per fully-verified finding.
 
@@ -441,6 +562,29 @@ async def create_vulnerability_report(
       (5) proof of concept (``poc_description`` + ``poc_script_code``),
       (6) impact (``impact``), (7) evidence (``evidence``), and
       (8) remediation (``remediation_steps``).
+
+    **Visual proof for triagers** (many reviewers will not run
+    ``poc_script_code`` themselves — screenshots and readable traffic are
+    often what they actually check):
+
+    - For any finding with a browser/UI-visible consequence, attach a
+      **before** screenshot (baseline, unexploited state) and an
+      **after** screenshot (the state that proves the exploit succeeded
+      — an alert fired, unauthorized data/panel visible, a value
+      changed, etc.) via the ``screenshots`` arg. Take them with
+      ``agent-browser screenshot`` (see the ``agent_browser`` skill),
+      then pass their sandbox paths here — do not just describe what a
+      screenshot would show. This does not apply to findings with no
+      meaningful visual state (e.g. a pure backend/dependency issue) —
+      use judgment, it is not required for every report.
+    - When a finding was demonstrated via intercepted or replayed HTTP
+      traffic, ``evidence`` MUST include the full raw request **and**
+      response (method, path, headers, body) exactly as returned by the
+      ``proxy`` tool's ``view_request`` — verbatim in labeled fenced
+      blocks, not summarized or paraphrased — so a non-technical triager
+      can see the exact traffic without running anything. Strip any
+      internal proxy/request IDs per the "No internal/system details"
+      rule above; keep only the actual HTTP content.
 
     **White-box requirement**: when source is available, you MUST
     populate ``code_locations``. See the ``code_locations`` arg below
@@ -637,6 +781,18 @@ async def create_vulnerability_report(
             fix (summary + rationale). Prose/markdown only — the code
             change itself belongs in ``code_locations``. Omit for
             black-box findings.
+        screenshots: Optional, at most 6. Before/after visual proof — see
+            "Visual proof for triagers" above. Each entry is
+            ``{"path": ..., "caption": ...}``:
+
+            - ``path`` (REQUIRED): sandbox path to a PNG/JPEG, e.g. what
+              ``agent-browser screenshot`` printed on stdout. Must be
+              under ``/workspace``.
+            - ``caption`` (REQUIRED): short label describing the moment
+              captured, e.g. ``"Before exploitation — default homepage"``
+              or ``"After exploitation — admin panel accessed as a
+              low-privilege user"``. This is the only thing shown next
+              to the image, so make it specific.
 
     Example (abbreviated — mirror this structure)::
 
@@ -675,6 +831,8 @@ async def create_vulnerability_report(
         fix_effort: "low"
     """
     agent_id, agent_name = _caller_identity(ctx)
+    inner = ctx.context if isinstance(ctx.context, dict) else {}
+    sandbox_session = inner.get("sandbox_session")
 
     result = await _do_create(
         title=title,
@@ -695,6 +853,8 @@ async def create_vulnerability_report(
         cwe=cwe,
         code_locations=code_locations,
         fix_pr_body=fix_pr_body,
+        screenshots=screenshots,
+        sandbox_session=sandbox_session,
         agent_id=agent_id,
         agent_name=agent_name,
     )
@@ -913,7 +1073,7 @@ def _build_dependency_evidence(
     return evidence
 
 
-async def _do_create_dependency(  # noqa: PLR0912
+async def _do_create_dependency(  # noqa: PLR0912, PLR0915
     *,
     title: str,
     description: str,
@@ -1046,48 +1206,50 @@ async def _do_create_dependency(  # noqa: PLR0912
 
         from strix.report.dedupe import check_duplicate
 
-        existing = report_state.get_existing_vulnerabilities()
-        candidate = {
-            "title": title,
-            "description": description,
-            "target": target,
-            "cve": parsed_cve,
-            "dependency_metadata": dependency_metadata,
-            "technical_analysis": technical_analysis,
-        }
-        dedupe = await check_duplicate(candidate, existing)
-        if dedupe.get("is_duplicate"):
-            duplicate_id = dedupe.get("duplicate_id", "")
-            return {
-                "success": False,
-                "error": (
-                    f"Potential duplicate (id={duplicate_id[:8]}...) — "
-                    "do not re-report the same dependency finding"
-                ),
-                "duplicate_of": duplicate_id,
-                "confidence": dedupe.get("confidence", 0.0),
-                "reason": dedupe.get("reason", ""),
+        # Serialized scan-wide -- see the matching lock in _do_create.
+        async with report_state.dedupe_lock:
+            existing = report_state.get_existing_vulnerabilities()
+            candidate = {
+                "title": title,
+                "description": description,
+                "target": target,
+                "cve": parsed_cve,
+                "dependency_metadata": dependency_metadata,
+                "technical_analysis": technical_analysis,
             }
+            dedupe = await check_duplicate(candidate, existing)
+            if dedupe.get("is_duplicate"):
+                duplicate_id = dedupe.get("duplicate_id", "")
+                return {
+                    "success": False,
+                    "error": (
+                        f"Potential duplicate (id={duplicate_id[:8]}...) — "
+                        "do not re-report the same dependency finding"
+                    ),
+                    "duplicate_of": duplicate_id,
+                    "confidence": dedupe.get("confidence", 0.0),
+                    "reason": dedupe.get("reason", ""),
+                }
 
-        report_id = report_state.add_vulnerability_report(
-            title=title,
-            description=description,
-            severity=severity,
-            impact=impact,
-            target=target,
-            technical_analysis=technical_analysis,
-            remediation_steps=remediation_steps,
-            evidence=evidence,
-            assumptions=assumptions,
-            fix_effort=fix_effort,
-            cvss=cvss_score if advisory_cvss is not None else None,
-            cve=parsed_cve,
-            cwe=cwe,
-            finding_class="dependency_cve",
-            dependency_metadata=dependency_metadata,
-            agent_id=agent_id if isinstance(agent_id, str) else None,
-            agent_name=agent_name if isinstance(agent_name, str) else None,
-        )
+            report_id = report_state.add_vulnerability_report(
+                title=title,
+                description=description,
+                severity=severity,
+                impact=impact,
+                target=target,
+                technical_analysis=technical_analysis,
+                remediation_steps=remediation_steps,
+                evidence=evidence,
+                assumptions=assumptions,
+                fix_effort=fix_effort,
+                cvss=cvss_score if advisory_cvss is not None else None,
+                cve=parsed_cve,
+                cwe=cwe,
+                finding_class="dependency_cve",
+                dependency_metadata=dependency_metadata,
+                agent_id=agent_id if isinstance(agent_id, str) else None,
+                agent_name=agent_name if isinstance(agent_name, str) else None,
+            )
     except (ImportError, AttributeError) as e:
         logger.exception("create_dependency_report persistence failed")
         return {"success": False, "error": f"Failed to create dependency report: {e!s}"}
@@ -1516,16 +1678,23 @@ async def list_reports(
 ) -> str:
     """List vulnerability reports filed so far in this scan — metadata-first.
 
-    **For the orchestrator / root agent.** This is an orchestration tool
-    for tracking scan-wide coverage and assembling the final report — leaf
-    / specialist agents do their own testing and file findings; they should
-    NOT call this. If you are a subagent, ignore it and focus on your task.
-
     Reports are shared across **every** agent in the scan, so this returns
-    findings filed by any agent (root or child), not just your own. As the
-    root agent, use it to track progress, avoid dispatching work on
-    already-covered ground, reason about attack-chaining across confirmed
-    findings, and build the ``finish_scan`` executive summary.
+    findings filed by any agent (root or child), not just your own.
+
+    **Leaf / specialist agents:** before sinking turns into exploitation or
+    PoC work on something you suspect is already known, do a quick targeted
+    check here first — e.g. ``list_reports(target="/search",
+    search="SQL injection")``. A cheap early check here is far cheaper than
+    finding out from a rejected ``create_vulnerability_report`` call after
+    you've already built the full PoC and CVSS breakdown. This does not
+    replace filing: ``create_vulnerability_report`` still runs its own
+    (authoritative) dedupe check, so a clear result here isn't a guarantee —
+    just a way to bail early on the obvious overlaps.
+
+    **Orchestrator / root agent:** use it to track scan-wide progress, avoid
+    dispatching work on already-covered ground, reason about attack-chaining
+    across confirmed findings, and build the ``finish_scan`` executive
+    summary.
 
     By default each entry is compact: ``id``, ``title``, ``severity``,
     ``cvss``, ``finding_class``, ``cve`` / ``cwe``, ``target`` /

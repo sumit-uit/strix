@@ -48,6 +48,7 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			m.closeModal()
 		}
 		m.syncMountPrompt()
+		m.syncManualSeedPrompt()
 		m.ensureAgentVisible()
 		m.ensureVulnerabilityVisible()
 		m.ready = true
@@ -430,7 +431,7 @@ func (m *Model) refreshAfterCollection(name string) tea.Cmd {
 	if name == "agents" {
 		m.ensureAgentVisible()
 		m.refreshViewport()
-		return m.notifyBudgetPause()
+		return tea.Batch(m.notifyBudgetPause(), m.notifyModelPause())
 	}
 	if name == "events" {
 		m.refreshViewport()
@@ -462,6 +463,31 @@ func (m *Model) notifyBudgetPause() tea.Cmd {
 	}
 	if !paused {
 		m.budgetPauseNotified = false
+	}
+	return nil
+}
+
+// notifyModelPause mirrors notifyBudgetPause for a model/quota-unavailable
+// pause: a one-shot warning toast when any agent parks on a persistent
+// capacity error, re-armed once none are paused this way.
+func (m *Model) notifyModelPause() tea.Cmd {
+	paused := false
+	for _, agent := range m.snapshot.Agents {
+		if agent.Status == "model_paused" {
+			paused = true
+			break
+		}
+	}
+	if paused && !m.modelPauseNotified {
+		m.modelPauseNotified = true
+		return m.showToastFor(
+			"Model/API unavailable — agent(s) paused. Resolve the issue, then send "+
+				"a message to continue.",
+			15*time.Second,
+		)
+	}
+	if !paused {
+		m.modelPauseNotified = false
 	}
 	return nil
 }

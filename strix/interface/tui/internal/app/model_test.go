@@ -991,10 +991,12 @@ func TestCrashedAndBudgetPausedAgentStatusParity(t *testing.T) {
 	model.snapshot.Agents = []protocol.Agent{
 		{ID: "crashed", Name: "Crashed agent", Status: "crashed", ErrorMessage: "provider failed"},
 		{ID: "paused", Name: "Paused agent", Status: "budget_paused"},
+		{ID: "model-paused", Name: "Model-paused agent", Status: "model_paused"},
 	}
 
 	tree := ansi.Strip(model.agentsView(50, 10))
-	if !strings.Contains(tree, "🔴 Crashed agent") || !strings.Contains(tree, "⏸ Paused agent") {
+	if !strings.Contains(tree, "🔴 Crashed agent") || !strings.Contains(tree, "⏸ Paused agent") ||
+		!strings.Contains(tree, "⏸ Model-paused agent") {
 		t.Fatalf("agent status icons do not match Textual: %s", tree)
 	}
 	crashed := ansi.Strip(model.statusView(100))
@@ -1006,6 +1008,11 @@ func TestCrashedAndBudgetPausedAgentStatusParity(t *testing.T) {
 	if !strings.Contains(paused, "Budget limit reached") || !strings.Contains(paused, "Send a message to continue") || !strings.Contains(paused, "ctrl-q") {
 		t.Fatalf("budget-paused status lacks Textual guidance: %s", paused)
 	}
+	model.selectedAgent = 2
+	modelPaused := ansi.Strip(model.statusView(100))
+	if !strings.Contains(modelPaused, "Model/API unavailable") || !strings.Contains(modelPaused, "Send a message to retry") || !strings.Contains(modelPaused, "ctrl-q") {
+		t.Fatalf("model-paused status lacks guidance: %s", modelPaused)
+	}
 }
 
 func TestStopDialogAndCommandAreLimitedToActiveAgents(t *testing.T) {
@@ -1016,6 +1023,7 @@ func TestStopDialogAndCommandAreLimitedToActiveAgents(t *testing.T) {
 		{status: "running", active: true},
 		{status: "waiting", active: true},
 		{status: "budget_paused", active: true},
+		{status: "model_paused", active: true},
 		{status: "completed"},
 		{status: "failed"},
 		{status: "crashed"},
@@ -1061,6 +1069,28 @@ func TestBudgetPauseShowsOneWarningToastUntilResumed(t *testing.T) {
 	}
 	model.snapshot.Agents[0].Status = "budget_paused"
 	if cmd := model.notifyBudgetPause(); cmd == nil {
+		t.Fatal("expected the toast to re-arm after resuming")
+	}
+}
+
+func TestModelPauseShowsOneWarningToastUntilResumed(t *testing.T) {
+	model := New(nil)
+	model.snapshot.Agents = []protocol.Agent{{ID: "root", Name: "Strix", Status: "model_paused"}}
+	if cmd := model.notifyModelPause(); cmd == nil {
+		t.Fatal("expected a toast command on first model pause")
+	}
+	if !strings.Contains(model.toast, "Model/API unavailable") {
+		t.Fatalf("toast %q missing model-unavailable warning", model.toast)
+	}
+	if cmd := model.notifyModelPause(); cmd != nil {
+		t.Fatal("model-unavailable toast should fire once per pause")
+	}
+	model.snapshot.Agents[0].Status = "running"
+	if cmd := model.notifyModelPause(); cmd != nil {
+		t.Fatal("no toast expected while running")
+	}
+	model.snapshot.Agents[0].Status = "model_paused"
+	if cmd := model.notifyModelPause(); cmd == nil {
 		t.Fatal("expected the toast to re-arm after resuming")
 	}
 }

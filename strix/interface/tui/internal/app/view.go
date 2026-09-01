@@ -681,6 +681,10 @@ func (m Model) statusView(width int) string {
 			left = lipgloss.NewStyle().Foreground(amber).Render("Budget limit reached") +
 				lipgloss.NewStyle().Foreground(dim).Render(" · Send a message to continue")
 			right = quitHint
+		case "model_paused":
+			left = lipgloss.NewStyle().Foreground(amber).Render("Model/API unavailable") +
+				lipgloss.NewStyle().Foreground(dim).Render(" · Send a message to retry")
+			right = quitHint
 		case "completed":
 			left = lipgloss.NewStyle().Foreground(mid).Render("Agent completed")
 		case "stopped":

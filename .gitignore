@@ -98,3 +98,12 @@ schema.graphql
 /.benchmarks/
 /references/
 /strix_runs_main/
+
+# Local engagement data - never commit (scope lists, PoCs, credentials)
+/ant-group-instructions.txt
+/vfs-global-instructions.txt
+/vinstruction.list
+/vtargetlist.list
+/webmdAuth.py
+/disclosures/
+/mdedgePOC/

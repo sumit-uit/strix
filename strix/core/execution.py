@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
+import time
 import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
@@ -21,6 +23,7 @@ from openai import (
 )
 
 from strix.config import codex
+from strix.config.sequential_mode import release_llm_gate_if_held
 from strix.core.hooks import (
     BudgetExceededError,
     BudgetPausedError,
@@ -111,10 +114,149 @@ _MAX_TRANSIENT_MODEL_RETRIES = 5
 _TRANSIENT_MODEL_RETRY_BASE_DELAY_S = 2.0
 _TRANSIENT_MODEL_RETRY_MAX_DELAY_S = 90.0
 
+# Rate limit specific backoff settings
+_RATE_LIMIT_BASE_DELAY_S = 3.0
+_RATE_LIMIT_MAX_DELAY_S = 300.0  # 5 minutes max wait for rate limits
+_RATE_LIMIT_MULTIPLIER = 1.5  # Slower growth for rate limits
+
+
+class RateLimitTracker:
+    """Tracks rate limit state across agents to implement coordinated backoff."""
+
+    def __init__(self) -> None:
+        self._last_rate_limit_time: dict[str, float] = {}
+        self._consecutive_rate_limits: dict[str, int] = {}
+        self._global_cooldown_until: float = 0  # Global cooldown if provider-wide limit hit
+
+    def record_rate_limit(self, provider: str) -> float:
+        """Record a rate limit and return recommended cooldown delay."""
+        now = time.time()
+
+        # Update consecutive counter
+        self._consecutive_rate_limits[provider] = self._consecutive_rate_limits.get(provider, 0) + 1
+
+        # Update last rate limit time
+        self._last_rate_limit_time[provider] = now
+
+        # Calculate backoff based on consecutive hits
+        consecutive = self._consecutive_rate_limits[provider]
+        base_delay = _RATE_LIMIT_BASE_DELAY_S * (_RATE_LIMIT_MULTIPLIER ** (consecutive - 1))
+
+        # Add jitter using secrets module
+        jitter = secrets.randbelow(400) / 1000.0 + 0.8  # 0.8 - 1.2
+        delay = min(base_delay * jitter, _RATE_LIMIT_MAX_DELAY_S)
+
+        # If this is a severe rate limit (consecutive > 3), extend global cooldown
+        if consecutive >= 3:
+            self._global_cooldown_until = now + delay * 0.5
+
+        return delay
+
+    def get_cooldown(self, provider: str) -> float:
+        """Get remaining cooldown time for a provider."""
+        now = time.time()
+        if self._global_cooldown_until > now:
+            return self._global_cooldown_until - now
+
+        last_time = self._last_rate_limit_time.get(provider, 0)
+        consecutive = self._consecutive_rate_limits.get(provider, 0)
+
+        if consecutive > 0:
+            base_delay = _RATE_LIMIT_BASE_DELAY_S * (_RATE_LIMIT_MULTIPLIER ** (consecutive - 1))
+            cooldown_end = last_time + base_delay
+            return max(0, cooldown_end - now)
+
+        return 0
+
+    def record_success(self, provider: str) -> None:
+        """Record a successful request, reducing cooldown."""
+        prev = self._consecutive_rate_limits.get(provider, 1)
+        self._consecutive_rate_limits[provider] = max(0, prev - 1)
+
+
+rate_limit_tracker = RateLimitTracker()
+
 
 def _model_error_status_code(exc: BaseException) -> int | None:
     code = getattr(exc, "status_code", None)
     return code if isinstance(code, int) else None
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Check if this is a rate limit error (429) or similar throttling."""
+    # Check status code
+    code = _model_error_status_code(exc)
+    if code == 429:
+        return True
+
+    # Check for rate limit indicators in message
+    message = str(exc).lower()
+    if any(term in message for term in ("rate limit", "too many requests", "throttl")):
+        return True
+
+    # Check for model-specific rate limit indicators
+    if hasattr(exc, "llm_provider"):
+        provider = getattr(exc, "llm_provider", "")
+        if (
+            isinstance(provider, str)
+            and "openai" in provider.lower()
+            and any(term in message for term in ("rpm", "tokens per minute", "requests per minute"))
+        ):
+            # OpenAI rate limits often include these messages
+            return True
+
+    return False
+
+
+_MODEL_UNAVAILABLE_STATUS_CODES = frozenset({429, 503})
+_MODEL_UNAVAILABLE_MESSAGE_TERMS = (
+    "rate limit",
+    "too many requests",
+    "throttl",
+    "quota",
+    "service unavailable",
+    "temporarily unavailable",
+    "all targets were skipped",
+    "no deployments available",
+    "no healthy upstream",
+)
+
+
+def _is_model_unavailable_error(exc: BaseException) -> bool:
+    """Capacity/quota-class errors: the provider (or every configured
+    deployment behind a router) is out of room right now, not that this one
+    request was malformed. Deliberately broader than ``_is_rate_limit_error``
+    -- it also covers a 503 across every target (e.g. litellm's
+    ``ALL_TARGETS_SKIPPED``), which isn't itself a "too many requests" message
+    but is the same class of "nothing to do but wait" failure.
+    """
+    if _is_rate_limit_error(exc):
+        return True
+    if _model_error_status_code(exc) in _MODEL_UNAVAILABLE_STATUS_CODES:
+        return True
+    message = str(exc).lower()
+    return any(term in message for term in _MODEL_UNAVAILABLE_MESSAGE_TERMS)
+
+
+async def _check_runtime_timeout(
+    start_time: float | None,
+    max_runtime: int | None,
+    coordinator: AgentCoordinator,
+    agent_id: str,
+) -> None:
+    """Check if agent has exceeded max_runtime and stop if so."""
+    if start_time is None or max_runtime is None:
+        return
+
+    elapsed = time.time() - start_time
+    if elapsed >= max_runtime:
+        logger.warning(
+            "agent %s exceeded max runtime (%ds); force-stopping and wrapping up",
+            agent_id,
+            max_runtime,
+        )
+        await coordinator.set_status(agent_id, "stopped")
+        raise TimeoutError(f"Agent exceeded max runtime of {max_runtime} seconds")
 
 
 def _is_transient_model_error(exc: BaseException) -> bool:
@@ -133,6 +275,14 @@ def _is_transient_model_error(exc: BaseException) -> bool:
 def _transient_model_retry_delay(attempt: int) -> float:
     delay = _TRANSIENT_MODEL_RETRY_BASE_DELAY_S * float(2 ** (attempt - 1))
     return min(delay, _TRANSIENT_MODEL_RETRY_MAX_DELAY_S)
+
+
+def _rate_limit_retry_delay(attempt: int) -> float:
+    """Calculate exponential backoff with jitter for rate limit errors."""
+    delay = _RATE_LIMIT_BASE_DELAY_S * (_RATE_LIMIT_MULTIPLIER ** (attempt - 1))
+    # Add some jitter to prevent thundering herd
+    jitter = secrets.randbelow(1000) / 1000.0  # 0.0 - 1.0
+    return min(delay * jitter, _RATE_LIMIT_MAX_DELAY_S)
 
 
 async def _salvage_stream_to_session(
@@ -169,7 +319,7 @@ async def _seed_and_prepare_first_input(
     return initial_input
 
 
-async def run_agent_loop(
+async def run_agent_loop(  # noqa: PLR0912
     *,
     agent: Any,
     initial_input: Any,
@@ -182,6 +332,7 @@ async def run_agent_loop(
     session: Session | None = None,
     start_parked: bool = False,
     event_sink: StreamEventSink | None = None,
+    max_runtime: int | None = None,
     hooks: RunHooks[dict[str, Any]] | None = None,
 ) -> RunResultBase | None:
     await coordinator.attach_runtime(
@@ -191,99 +342,114 @@ async def run_agent_loop(
     )
     result: RunResultBase | None = None
 
-    first_cycle_input = await _seed_and_prepare_first_input(
-        session, initial_input, start_parked=start_parked
-    )
+    try:
+        first_cycle_input = await _seed_and_prepare_first_input(
+            session, initial_input, start_parked=start_parked
+        )
 
-    budget_stopped = coordinator.budget_stopped
-    reserve_stopped = coordinator.reserve_stopped
-    if budget_stopped:
-        await coordinator.set_status(agent_id, "stopped")
-        raise BudgetExceededError("scan budget reached")
-    if reserve_stopped and context.get("parent_id") is not None:
-        await coordinator.set_status(agent_id, "stopped")
-        raise SubagentBudgetReservedError("scan reached the sub-agent budget reserve")
-
-    if reserve_stopped and start_parked and interactive and context.get("parent_id") is None:
-        await coordinator.send(agent_id, _reserve_notice())
-
-    if not (start_parked and interactive):
-        with contextlib.suppress(BudgetPausedError):
-            result = await _run_until_lifecycle(
-                agent,
-                coordinator,
-                agent_id,
-                initial_input=first_cycle_input,
-                run_config=run_config,
-                context=context,
-                max_turns=max_turns,
-                session=session,
-                interactive=interactive,
-                event_sink=event_sink,
-                hooks=hooks,
-            )
-
-    if not interactive:
-        return result
-
-    while True:
-        timeout = await _plain_waiting_timeout(coordinator, agent_id)
-        try:
-            woke = await coordinator.wait_for_message(agent_id, timeout=timeout)
-        except asyncio.CancelledError:
-            return result
-
-        if coordinator.budget_stopped:
+        budget_stopped = coordinator.budget_stopped
+        reserve_stopped = coordinator.reserve_stopped
+        if budget_stopped:
             await coordinator.set_status(agent_id, "stopped")
             raise BudgetExceededError("scan budget reached")
-
-        if coordinator.reserve_stopped and context.get("parent_id") is not None:
+        if reserve_stopped and context.get("parent_id") is not None:
             await coordinator.set_status(agent_id, "stopped")
             raise SubagentBudgetReservedError("scan reached the sub-agent budget reserve")
 
-        if woke:
-            # Real input is real progress, so the nudge budget starts over. A bare
-            # auto-resume is not: it must not hand a wedged agent a fresh budget.
-            await coordinator.reset_recovery(agent_id)
-            await coordinator.reset_idle_resumes(agent_id)
-        else:
-            idle_resumes = await coordinator.record_idle_resume(agent_id)
-            if idle_resumes >= _MAX_IDLE_AUTO_RESUMES:
-                logger.warning(
-                    "agent %s auto-resumed %d times without hearing from anyone; "
-                    "leaving it parked until a real message arrives",
-                    agent_id,
-                    idle_resumes,
-                )
-                await coordinator.park_waiting(agent_id, wait_kind="stalled")
-                await _notify_parent_on_stall(coordinator, agent_id)
-                continue
-            logger.info("agent %s reached its waiting timeout; auto-resuming", agent_id)
-            await coordinator.send(
-                agent_id,
-                {
-                    "from": "system",
-                    "type": "auto_resume",
-                    "content": "Waiting timeout reached. Resuming execution.",
-                },
-                interrupt=False,
-            )
+        if reserve_stopped and start_parked and interactive and context.get("parent_id") is None:
+            await coordinator.send(agent_id, _reserve_notice())
 
-        await coordinator.consume_pending(agent_id)
-        with contextlib.suppress(BudgetPausedError):
-            result = await _run_until_lifecycle(
-                agent,
-                coordinator,
-                agent_id,
-                initial_input=[],
-                run_config=run_config,
-                context=context,
-                max_turns=max_turns,
-                session=session,
-                interactive=True,
-                event_sink=event_sink,
-                hooks=hooks,
-            )
+        # Track start time for runtime limit
+        start_time = time.time() if max_runtime is not None else None
+
+        if not (start_parked and interactive):
+            with contextlib.suppress(BudgetPausedError):
+                result = await _run_until_lifecycle(
+                    agent,
+                    coordinator,
+                    agent_id,
+                    initial_input=first_cycle_input,
+                    run_config=run_config,
+                    context=context,
+                    max_turns=max_turns,
+                    session=session,
+                    interactive=interactive,
+                    event_sink=event_sink,
+                    hooks=hooks,
+                )
+                # Check runtime after each cycle
+                await _check_runtime_timeout(start_time, max_runtime, coordinator, agent_id)
+
+        if not interactive:
+            return result
+
+        while True:
+            timeout = await _plain_waiting_timeout(coordinator, agent_id)
+            try:
+                woke = await coordinator.wait_for_message(agent_id, timeout=timeout)
+            except asyncio.CancelledError:
+                return result
+
+            if coordinator.budget_stopped:
+                await coordinator.set_status(agent_id, "stopped")
+                raise BudgetExceededError("scan budget reached")
+
+            if coordinator.reserve_stopped and context.get("parent_id") is not None:
+                await coordinator.set_status(agent_id, "stopped")
+                raise SubagentBudgetReservedError("scan reached the sub-agent budget reserve")
+
+            # Check runtime after waiting
+            await _check_runtime_timeout(start_time, max_runtime, coordinator, agent_id)
+
+            if woke:
+                # Real input is real progress, so the nudge budget starts over. A bare
+                # auto-resume is not: it must not hand a wedged agent a fresh budget.
+                await coordinator.reset_recovery(agent_id)
+                await coordinator.reset_idle_resumes(agent_id)
+            else:
+                idle_resumes = await coordinator.record_idle_resume(agent_id)
+                if idle_resumes >= _MAX_IDLE_AUTO_RESUMES:
+                    logger.warning(
+                        "agent %s auto-resumed %d times without hearing from anyone; "
+                        "leaving it parked until a real message arrives",
+                        agent_id,
+                        idle_resumes,
+                    )
+                    await coordinator.park_waiting(agent_id, wait_kind="stalled")
+                    await _notify_parent_on_stall(coordinator, agent_id)
+                    continue
+                logger.info("agent %s reached its waiting timeout; auto-resuming", agent_id)
+                await coordinator.send(
+                    agent_id,
+                    {
+                        "from": "system",
+                        "type": "auto_resume",
+                        "content": "Waiting timeout reached. Resuming execution.",
+                    },
+                    interrupt=False,
+                )
+
+            await coordinator.consume_pending(agent_id)
+            with contextlib.suppress(BudgetPausedError):
+                result = await _run_until_lifecycle(
+                    agent,
+                    coordinator,
+                    agent_id,
+                    initial_input=[],
+                    run_config=run_config,
+                    context=context,
+                    max_turns=max_turns,
+                    session=session,
+                    interactive=True,
+                    event_sink=event_sink,
+                    hooks=hooks,
+                )
+    finally:
+        # --sequential-agents safety net: guarantee this agent's model-call
+        # gate is released no matter how its run ended, even if its last
+        # on_llm_start never got a matching on_llm_end (a failed/retried
+        # call). See strix.config.sequential_mode.
+        release_llm_gate_if_held(context, agent_id)
 
 
 async def spawn_child_agent(
@@ -294,6 +460,7 @@ async def spawn_child_agent(
     sessions_to_close: list[SQLiteSession],
     run_config: RunConfig,
     max_turns: int,
+    max_runtime: int | None,
     interactive: bool,
     parent_ctx: dict[str, Any],
     name: str,
@@ -324,6 +491,7 @@ async def spawn_child_agent(
         sessions_to_close=sessions_to_close,
         run_config=run_config,
         max_turns=max_turns,
+        max_runtime=max_runtime,
         interactive=interactive,
         child_agent=child_agent,
         child_id=child_id,
@@ -358,6 +526,7 @@ async def respawn_subagents(
     sessions_to_close: list[SQLiteSession],
     run_config: RunConfig,
     max_turns: int,
+    max_runtime: int | None,
     interactive: bool,
     parent_ctx: dict[str, Any],
     root_id: str,
@@ -407,6 +576,7 @@ async def respawn_subagents(
                 sessions_to_close=sessions_to_close,
                 run_config=run_config,
                 max_turns=max_turns,
+                max_runtime=max_runtime,
                 interactive=interactive,
                 child_agent=child_agent,
                 child_id=child_id,
@@ -757,12 +927,19 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     )
                     input_data = []
                     continue
-            if model_retries < _MAX_TRANSIENT_MODEL_RETRIES and _is_transient_model_error(exc):
+            if model_retries < _MAX_TRANSIENT_MODEL_RETRIES and (
+                _is_transient_model_error(exc) or _is_model_unavailable_error(exc)
+            ):
                 model_retries += 1
-                delay = _transient_model_retry_delay(model_retries)
+                if _is_model_unavailable_error(exc):
+                    delay = _rate_limit_retry_delay(model_retries)
+                    retry_type = "rate_limit"
+                else:
+                    delay = _transient_model_retry_delay(model_retries)
+                    retry_type = "transient"
                 logger.warning(
-                    "transient model/provider error for %s; replaying turn "
-                    "(attempt %d/%d, backoff %.1fs): %r",
+                    "%s error for %s; replaying turn (attempt %d/%d, backoff %.1fs): %r",
+                    retry_type,
                     agent_id,
                     model_retries,
                     _MAX_TRANSIENT_MODEL_RETRIES,
@@ -775,6 +952,16 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 continue
             if session is not None:
                 await _salvage_stream_to_session(session, pre_run_items, stream, agent_id)
+            if interactive and _is_model_unavailable_error(exc):
+                logger.warning(
+                    "agent %s exhausted retries on a persistent model/quota-unavailable "
+                    "error; pausing until the user resolves it: %r",
+                    agent_id,
+                    exc,
+                )
+                await coordinator.pause_for_model_unavailable(agent_id)
+                await _notify_parent_on_model_pause(coordinator, agent_id)
+                return None
             if isinstance(exc, ProviderRefusalError):
                 logger.warning("agent %s refused by the model provider: %s", agent_id, exc)
                 await coordinator.set_status(agent_id, "failed", error=str(exc))
@@ -885,6 +1072,15 @@ _STALL_NOTICE = (
 )
 
 
+_MODEL_UNAVAILABLE_NOTICE = (
+    "[Model unavailable] {name} ({agent_id}) hit a persistent model/provider capacity "
+    "error (rate limit, quota, or a service outage) and is paused, not failed — it kept "
+    "its progress. It will not send a completion report until this clears. Do not treat "
+    "it as done and do not spawn a replacement for its task. Once the model/API access "
+    "is working again, send it a message (or send one to any agent) to resume it."
+)
+
+
 async def _notify_parent_on_stall(
     coordinator: AgentCoordinator,
     agent_id: str,
@@ -902,6 +1098,35 @@ async def _notify_parent_on_stall(
             "type": "stalled",
             "priority": "high",
             "content": _STALL_NOTICE.format(name=name, agent_id=agent_id),
+        },
+        interrupt=False,
+    )
+
+
+async def _notify_parent_on_model_pause(
+    coordinator: AgentCoordinator,
+    agent_id: str,
+) -> None:
+    """Tell the parent a child paused on a model/quota outage, not that it died.
+
+    Deliberately not routed through ``notify_parent_on_terminal`` / the
+    ``claim_parent_notice`` slot: this agent isn't done, so its eventual real
+    completion report still needs to land later. ``interrupt=False`` matches
+    ``_notify_parent_on_stall`` -- an FYI, not something worth cancelling the
+    parent's in-flight turn for.
+    """
+    async with coordinator._lock:
+        parent = coordinator.parent_of.get(agent_id)
+        name = coordinator.names.get(agent_id, agent_id)
+    if parent is None:
+        return
+    await coordinator.send(
+        parent,
+        {
+            "from": agent_id,
+            "type": "model_paused",
+            "priority": "high",
+            "content": _MODEL_UNAVAILABLE_NOTICE.format(name=name, agent_id=agent_id),
         },
         interrupt=False,
     )
@@ -979,6 +1204,7 @@ async def _start_child_runner(
     sessions_to_close: list[SQLiteSession],
     run_config: RunConfig,
     max_turns: int,
+    max_runtime: int | None,
     interactive: bool,
     child_agent: Any,
     child_id: str,
@@ -1018,6 +1244,7 @@ async def _start_child_runner(
                 session=session,
                 start_parked=start_parked,
                 event_sink=event_sink,
+                max_runtime=max_runtime,
                 hooks=hooks,
             )
         except BudgetExceededError:
@@ -1028,5 +1255,12 @@ async def _start_child_runner(
             if not coordinator.is_shutting_down:
                 await _notify_parent_on_exit(coordinator, child_id)
 
+    # Children always run as their own background task, whether or not
+    # --sequential-agents is set. Interactive agents never return from their
+    # run loop on their own (they park waiting for follow-up messages once
+    # done), so awaiting a child's whole lifetime inline from here — instead
+    # of creating a task — would deadlock the parent's tool call forever.
+    # Sequential mode is enforced instead by serializing model calls via
+    # ``sequential_mode.gate_from_context`` inside ``_run_cycle``.
     task_handle = asyncio.create_task(_child_loop(), name=f"agent-{name}-{child_id}")
     await coordinator.attach_runtime(child_id, task=task_handle)

@@ -74,6 +74,8 @@ Complex findings warrant specialized subagents:
 - Validation agent confirms exploitability
 - Reporting agent documents with reproduction steps AND supplies the fix inline (the report tool carries the patch via `code_locations`/`fix_pr_body`) — do not add a separate fix agent that re-derives the same patch
 
+This pattern is for the root agent decomposing the scan, not something every subagent should re-run on itself. `create_agent` enforces a hard depth and total-agent cap per scan — a Discovery/Validation agent that spawns its own Discovery/Validation children for the same vulnerability classes will exhaust it fast. A subagent several levels deep should do its assigned work directly or hand off via `send_message_to_agent`, not decompose further.
+
 **Resource Efficiency**
 
 - Avoid duplicate coverage across agents

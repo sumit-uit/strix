@@ -8,11 +8,11 @@ import io
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agents import RunConfig
+from agents import RunConfig, ToolExecutionConfig
 from agents.sandbox import SandboxRunConfig
 from openai import RateLimitError
 
@@ -24,6 +24,7 @@ from strix.config.models import (
     configure_sdk_model_defaults,
     uses_chat_completions_tool_schema,
 )
+from strix.config.sequential_mode import create_llm_gate
 from strix.config.settings import DEFAULT_MAX_TURNS
 from strix.core.agents import AgentCoordinator
 from strix.core.execution import (
@@ -119,12 +120,15 @@ async def run_strix_scan(
     interactive: bool = False,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_budget_usd: float | None = None,
+    max_runtime: int | None = None,
     model: str | None = None,
     cleanup_on_exit: bool = True,
     event_sink: StreamEventSink | None = None,
     root_instructions_override: str | None = None,
     extra_system_prompt_context: dict[str, Any] | None = None,
     status_sink: StatusSink | None = None,
+    sequential_execution: bool = False,
+    manual_seed_gate: Callable[[str], Awaitable[None]] | None = None,
 ) -> RunResultBase | None:
     """Run or resume one Strix scan against a sandbox.
 
@@ -136,6 +140,10 @@ async def run_strix_scan(
     ``extra_system_prompt_context`` is merged into the root agent's scan
     context before prompt rendering. Child agents keep the standard scan prompt
     and context.
+    ``manual_seed_gate``, when provided, is awaited with the resolved host-side
+    Caido proxy URL right after the sandbox is up and before any agent is
+    built, so a caller can pause and let the user manually authenticate
+    through the proxy before the scan starts touching the target.
     """
 
     def report(phase: str) -> None:
@@ -199,6 +207,7 @@ async def run_strix_scan(
                 f"Cannot resume scan {scan_id}: missing SDK session database at {agents_db}",
             )
         await coordinator.restore(snap)
+        await coordinator.clear_model_paused()
         report_state = get_global_report_state()
         if report_state is not None:
             budget_stopped, reserve_stopped = recomputed_budget_flags(
@@ -235,8 +244,18 @@ async def run_strix_scan(
         extra_files=extra_files,
         status_sink=status_sink,
     )
-    report("Waiting for the first model response")
     logger.info("Sandbox ready for scan %s", scan_id)
+
+    host_caido_url = bundle.get("host_caido_url")
+    report_state = get_global_report_state()
+    if report_state is not None and host_caido_url:
+        report_state.caido_url = host_caido_url
+
+    if manual_seed_gate is not None and host_caido_url:
+        report("Waiting for manual session seeding")
+        await manual_seed_gate(host_caido_url)
+
+    report("Waiting for the first model response")
 
     sandbox_session = bundle["session"]
 
@@ -277,12 +296,26 @@ async def run_strix_scan(
             # A hallucinated tool name is a recoverable model mistake, not a scan-ending
             # error: hand it back as a tool result so the agent can correct itself.
             tool_not_found_behavior="return_error_to_model",
+            # --sequential-agents: without this, the SDK still starts every tool
+            # call an agent's turn requests concurrently (its own asyncio.Task
+            # each), so a single turn that calls create_agent twice spawns both
+            # children before either gets a chance to do anything. This doesn't
+            # by itself serialize the *work* those children do (see the
+            # sequential_llm_gate below for that) -- it just keeps the SDK from
+            # fanning a single turn's tool calls out in parallel.
+            tool_execution=(
+                ToolExecutionConfig(max_function_tool_concurrency=1)
+                if sequential_execution
+                else None
+            ),
         )
+        sequential_llm_gate = create_llm_gate(sequential_execution)
         hooks = ReportUsageHooks(
             model=resolved_model,
             max_budget_usd=max_budget_usd,
             max_turns=max_turns,
             interactive=interactive,
+            llm_gate=sequential_llm_gate,
         )
         if interactive:
             coordinator.set_budget_extender(hooks.extend_budget)
@@ -335,6 +368,7 @@ async def run_strix_scan(
                 sessions_to_close=sessions_to_close,
                 run_config=run_config,
                 max_turns=max_turns,
+                max_runtime=max_runtime,
                 interactive=interactive,
                 event_sink=event_sink,
                 hooks=hooks,
@@ -350,6 +384,9 @@ async def run_strix_scan(
             "interactive": interactive,
             "spawn_child_agent": spawn_child_agent,
             "max_context_images": settings.runtime.max_context_images,
+            "sequential_execution": sequential_execution,
+            "sequential_llm_gate": sequential_llm_gate,
+            "max_runtime": max_runtime,
         }
 
         root_session = open_agent_session(root_id, agents_db)
@@ -364,6 +401,7 @@ async def run_strix_scan(
                 sessions_to_close=sessions_to_close,
                 run_config=run_config,
                 max_turns=max_turns,
+                max_runtime=max_runtime,
                 interactive=interactive,
                 parent_ctx=context,
                 root_id=root_id,
@@ -409,6 +447,7 @@ async def run_strix_scan(
             session=root_session,
             start_parked=bool(interactive and is_resume and root_status != "running"),
             event_sink=event_sink,
+            max_runtime=max_runtime,
             hooks=hooks,
         )
         if not interactive and result is not None:

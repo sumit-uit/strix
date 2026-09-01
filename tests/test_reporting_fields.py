@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import asyncio
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -93,6 +94,60 @@ async def test_create_report_persists_new_fields(report_state: ReportState) -> N
     assert report["finding_class"] == "dynamic"
 
 
+async def test_concurrent_reports_for_same_finding_do_not_race(
+    report_state: ReportState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: two agents filing the same finding at nearly the same time
+    used to both read the (still-empty) existing-reports list before either
+    insert landed, both get ``is_duplicate=False`` from the dedupe check, and
+    both got inserted. ``ReportState.dedupe_lock`` closes that window by
+    serializing the whole read-check-insert critical section in ``_do_create``
+    (see the matching lock in ``_do_create_dependency``).
+    """
+
+    async def fake_check_duplicate(
+        candidate: dict[str, object],
+        existing: list[dict[str, object]],
+    ) -> dict[str, object]:
+        # Stands in for the real LLM round trip: a genuine await point between
+        # reading `existing` and inserting, long enough for a second call to
+        # interleave if nothing serializes them.
+        await asyncio.sleep(0)
+        for report in existing:
+            if report.get("title") == candidate.get("title"):
+                return {"is_duplicate": True, "duplicate_id": report["id"], "confidence": 1.0}
+        return {"is_duplicate": False, "duplicate_id": "", "confidence": 1.0}
+
+    monkeypatch.setattr("strix.report.dedupe.check_duplicate", fake_check_duplicate)
+
+    kwargs: dict[str, Any] = {
+        "title": "SQLi in /search via q",
+        "description": "q is concatenated into the query.",
+        "impact": "Full DB read.",
+        "target": "https://app.example.com",
+        "technical_analysis": "Unsanitized input reaches the query builder.",
+        "poc_description": "1. GET /search?q=' OR 1=1--",
+        "poc_script_code": "GET /search?q=' OR 1=1--",
+        "remediation_steps": "Use parameterized queries.",
+        "evidence": "Error-based injection confirmed.",
+        "assumptions": "None.",
+        "fix_effort": "low",
+        "cvss_breakdown": _CVSS,
+        "endpoint": "/search",
+        "method": "GET",
+        "cve": None,
+        "cwe": None,
+        "code_locations": None,
+    }
+
+    result_a, result_b = await asyncio.gather(_do_create(**kwargs), _do_create(**kwargs))
+
+    outcomes = sorted([result_a["success"], result_b["success"]])
+    assert outcomes == [False, True]
+    assert len(report_state.vulnerability_reports) == 1
+
+
 async def test_create_report_requires_evidence_and_assumptions(
     report_state: ReportState,
 ) -> None:
@@ -144,6 +199,243 @@ async def test_create_report_rejects_invalid_fix_effort(report_state: ReportStat
     )
     assert result["success"] is False
     assert any("fix_effort" in e for e in result["errors"])
+    assert not report_state.vulnerability_reports
+
+
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+_NOT_AN_IMAGE_BYTES = b"just some text, not an image"
+
+
+class _FakeReadFile:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.closed = False
+
+    def read(self, _n: int = -1) -> bytes:
+        return self._data
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSandboxSession:
+    """Stands in for the real sandbox session's ``read`` (see base_sandbox_session.py)."""
+
+    def __init__(self, files: dict[str, bytes]) -> None:
+        self.files = files
+        self.read_calls: list[str] = []
+
+    async def read(self, path: Path, *, user: object = None) -> _FakeReadFile:  # noqa: ARG002
+        key = str(path)
+        self.read_calls.append(key)
+        if key not in self.files:
+            raise FileNotFoundError(key)
+        return _FakeReadFile(self.files[key])
+
+
+def _screenshot_kwargs(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "title": "Reflected XSS in search",
+        "description": "q reflects unencoded input.",
+        "impact": "Session theft.",
+        "target": "https://app.example.com",
+        "technical_analysis": "Input interpolated into HTML.",
+        "poc_description": "1. open /search?q=<payload>",
+        "poc_script_code": "GET /search?q=<script>alert(1)</script>",
+        "remediation_steps": "Context-encode output.",
+        "evidence": "Response echoes the payload verbatim.",
+        "assumptions": "Assumes a victim opens a crafted link.",
+        "fix_effort": "low",
+        "cvss_breakdown": _CVSS,
+        "endpoint": "/search",
+        "method": "GET",
+        "cve": None,
+        "cwe": None,
+        "code_locations": None,
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_create_report_persists_screenshots(report_state: ReportState) -> None:
+    session = _FakeSandboxSession(
+        {
+            "/workspace/.agent-browser-screenshots/before.png": _PNG_BYTES,
+            "/workspace/.agent-browser-screenshots/after.png": _PNG_BYTES,
+        },
+    )
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[
+                {
+                    "path": "/workspace/.agent-browser-screenshots/before.png",
+                    "caption": "Before exploitation",
+                },
+                {
+                    "path": "/workspace/.agent-browser-screenshots/after.png",
+                    "caption": "After exploitation",
+                },
+            ],
+            sandbox_session=session,
+        ),
+    )
+    assert result["success"] is True
+    report = report_state.vulnerability_reports[0]
+    shots = report["screenshots"]
+    assert [s["caption"] for s in shots] == ["Before exploitation", "After exploitation"]
+    assert shots[0]["path"] == f"{report['id']}/screenshots/01-before-exploitation.png"
+
+    saved_file = report_state.get_run_dir() / "vulnerabilities" / shots[0]["path"]
+    assert saved_file.read_bytes() == _PNG_BYTES
+
+
+async def test_create_report_without_screenshots_is_unaffected(
+    report_state: ReportState,
+) -> None:
+    result = await _do_create(**_screenshot_kwargs())
+    assert result["success"] is True
+    assert "screenshots" not in report_state.vulnerability_reports[0]
+
+
+async def test_create_report_rejects_screenshot_path_traversal(
+    report_state: ReportState,
+) -> None:
+    session = _FakeSandboxSession({})
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[{"path": "/workspace/../etc/passwd", "caption": "x"}],
+            sandbox_session=session,
+        ),
+    )
+    assert result["success"] is False
+    assert any(".." in e for e in result["errors"])
+    assert session.read_calls == []
+    assert not report_state.vulnerability_reports
+
+
+async def test_create_report_rejects_screenshot_path_outside_workspace(
+    report_state: ReportState,
+) -> None:
+    session = _FakeSandboxSession({})
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[{"path": "/etc/passwd", "caption": "x"}],
+            sandbox_session=session,
+        ),
+    )
+    assert result["success"] is False
+    assert any("/workspace" in e for e in result["errors"])
+    assert session.read_calls == []
+    assert not report_state.vulnerability_reports
+
+
+async def test_create_report_rejects_screenshot_missing_caption(
+    report_state: ReportState,
+) -> None:
+    session = _FakeSandboxSession({"/workspace/shot.png": _PNG_BYTES})
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[{"path": "/workspace/shot.png", "caption": ""}],
+            sandbox_session=session,
+        ),
+    )
+    assert result["success"] is False
+    assert any("caption" in e for e in result["errors"])
+    assert session.read_calls == []
+    assert not report_state.vulnerability_reports
+
+
+async def test_create_report_rejects_too_many_screenshots(report_state: ReportState) -> None:
+    session = _FakeSandboxSession({})
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[{"path": f"/workspace/{i}.png", "caption": str(i)} for i in range(7)],
+            sandbox_session=session,
+        ),
+    )
+    assert result["success"] is False
+    assert any("at most 6" in e for e in result["errors"])
+    assert not report_state.vulnerability_reports
+
+
+async def test_create_report_rejects_oversized_screenshot(report_state: ReportState) -> None:
+    huge = _PNG_BYTES + b"\x00" * (10 * 1024 * 1024)
+    session = _FakeSandboxSession({"/workspace/big.png": huge})
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[{"path": "/workspace/big.png", "caption": "too big"}],
+            sandbox_session=session,
+        ),
+    )
+    assert result["success"] is False
+    assert any("size limit" in e for e in result["errors"])
+    assert not report_state.vulnerability_reports
+
+
+async def test_create_report_rejects_non_image_screenshot(report_state: ReportState) -> None:
+    session = _FakeSandboxSession({"/workspace/notes.txt": _NOT_AN_IMAGE_BYTES})
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[{"path": "/workspace/notes.txt", "caption": "not an image"}],
+            sandbox_session=session,
+        ),
+    )
+    assert result["success"] is False
+    assert any("not a recognized" in e for e in result["errors"])
+    assert not report_state.vulnerability_reports
+
+
+async def test_create_report_rejects_unreadable_screenshot_path(
+    report_state: ReportState,
+) -> None:
+    session = _FakeSandboxSession({})  # path not present -> FileNotFoundError
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[{"path": "/workspace/missing.png", "caption": "gone"}],
+            sandbox_session=session,
+        ),
+    )
+    assert result["success"] is False
+    assert any("could not read" in e for e in result["errors"])
+    assert not report_state.vulnerability_reports
+
+
+async def test_create_report_screenshots_without_sandbox_session_fails(
+    report_state: ReportState,
+) -> None:
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[{"path": "/workspace/shot.png", "caption": "x"}],
+        ),
+    )
+    assert result["success"] is False
+    assert any("sandbox session unavailable" in e for e in result["errors"])
+    assert not report_state.vulnerability_reports
+
+
+async def test_duplicate_report_never_reads_screenshots(
+    report_state: ReportState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dedupe must short-circuit before any sandbox I/O for screenshots."""
+
+    async def fake_check_duplicate(
+        _candidate: dict[str, object], _existing: list[dict[str, object]]
+    ) -> dict[str, object]:
+        return {"is_duplicate": True, "duplicate_id": "vuln-0001", "confidence": 1.0}
+
+    monkeypatch.setattr("strix.report.dedupe.check_duplicate", fake_check_duplicate)
+    session = _FakeSandboxSession({"/workspace/shot.png": _PNG_BYTES})
+
+    result = await _do_create(
+        **_screenshot_kwargs(
+            screenshots=[{"path": "/workspace/shot.png", "caption": "x"}],
+            sandbox_session=session,
+        ),
+    )
+    assert result["success"] is False
+    assert result.get("duplicate_of") == "vuln-0001"
+    assert session.read_calls == []
     assert not report_state.vulnerability_reports
 
 

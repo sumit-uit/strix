@@ -106,7 +106,14 @@ def is_verified() -> bool:
     absent, blank, or unparseable requires re-verification rather than unlocking
     forever, keeping the local gate in step with the relay (which rejects an
     expired token on report send).
+
+    ``STRIX_VIEWER_SKIP_EMAIL_GATE`` bypasses this for local history browsing
+    only -- it never touches ``read_auth()``/``write_auth()``, so report send
+    (which reads the stored record directly, not this function) still needs a
+    real relay-verified token regardless.
     """
+    if load_settings().viewer.skip_email_gate:
+        return True
     record = read_auth()
     if record is None:
         return False

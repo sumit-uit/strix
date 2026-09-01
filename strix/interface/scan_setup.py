@@ -49,6 +49,22 @@ logger = logging.getLogger(__name__)
 
 HOST_GATEWAY_HOSTNAME = "host.docker.internal"
 
+# preflight_model_connection is the one unprotected model call in the whole
+# startup path -- unlike a mid-scan turn (strix.core.execution retries
+# transient errors, and pauses rather than aborting on a persistent
+# capacity/quota error), a single failed request here previously killed the
+# launch outright. A short, bounded retry smooths over the same transient
+# 429/503/"all targets skipped" blips seen mid-scan, without making a user
+# wait minutes just to reach the TUI.
+_PREFLIGHT_MAX_RETRIES = 3
+_PREFLIGHT_RETRY_BASE_DELAY_S = 2.0
+_PREFLIGHT_RETRY_MAX_DELAY_S = 15.0
+
+
+def _preflight_retry_delay(attempt: int) -> float:
+    delay = _PREFLIGHT_RETRY_BASE_DELAY_S * float(2 ** (attempt - 1))
+    return min(delay, _PREFLIGHT_RETRY_MAX_DELAY_S)
+
 
 class ModelConnectionError(RuntimeError):
     """An ordinary model preflight failure, annotated with its model route."""
@@ -63,10 +79,18 @@ async def preflight_model_connection(
     *,
     settings: Settings | None = None,
 ) -> None:
-    """Verify the configured model route before starting a scan."""
+    """Verify the configured model route before starting a scan.
+
+    Retries a bounded number of times on a transient or capacity/quota error
+    (rate limit, 503, a custom routing proxy's "all targets were skipped by
+    pre-dispatch filters") before giving up -- see the module-level comment
+    on ``_PREFLIGHT_MAX_RETRIES``. A non-transient error (bad model name,
+    auth failure, etc.) still raises immediately.
+    """
     from agents.models.interface import ModelTracing
 
     from strix.config.models import StrixProvider, configure_sdk_model_defaults
+    from strix.core.execution import _is_model_unavailable_error, _is_transient_model_error
     from strix.core.inputs import make_model_settings
 
     resolved_settings = load_settings() if settings is None else settings
@@ -80,21 +104,41 @@ async def preflight_model_connection(
         extra_headers=resolved_settings.llm.extra_headers,
         has_tools=False,
     )
-    await asyncio.wait_for(
-        model.get_response(
-            system_instructions="You are a helpful assistant.",
-            input="Reply with just 'OK'.",
-            model_settings=request_settings,
-            tools=[],
-            output_schema=None,
-            handoffs=[],
-            tracing=ModelTracing.DISABLED,
-            previous_response_id=None,
-            conversation_id=None,
-            prompt=None,
-        ),
-        timeout=resolved_settings.llm.timeout,
-    )
+
+    attempt = 0
+    while True:
+        try:
+            await asyncio.wait_for(
+                model.get_response(
+                    system_instructions="You are a helpful assistant.",
+                    input="Reply with just 'OK'.",
+                    model_settings=request_settings,
+                    tools=[],
+                    output_schema=None,
+                    handoffs=[],
+                    tracing=ModelTracing.DISABLED,
+                    previous_response_id=None,
+                    conversation_id=None,
+                    prompt=None,
+                ),
+                timeout=resolved_settings.llm.timeout,
+            )
+        except Exception as exc:
+            attempt += 1
+            retryable = _is_transient_model_error(exc) or _is_model_unavailable_error(exc)
+            if attempt > _PREFLIGHT_MAX_RETRIES or not retryable:
+                raise
+            delay = _preflight_retry_delay(attempt)
+            logger.warning(
+                "model preflight check failed (attempt %d/%d), retrying in %.1fs: %r",
+                attempt,
+                _PREFLIGHT_MAX_RETRIES,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
+        else:
+            return
 
 
 def build_targets_info(args: argparse.Namespace) -> None:

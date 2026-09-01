@@ -32,6 +32,12 @@ def _accepts_required_tool_choice(model_name: str | None) -> bool:
         if name.startswith(prefix):
             name = name[len(prefix) :]
             break
+    # auto/* (OmniRoute-style virtual routing combos) are routed through the
+    # OpenAI-compatible provider path in StrixProvider._resolve_prefixed_model,
+    # so tool_choice="required" is valid to send even though the name itself
+    # isn't a known OpenAI model id.
+    if name.startswith("auto/"):
+        return True
     return name.startswith("openai/") or is_known_openai_bare_model(name)
 
 

@@ -258,6 +258,57 @@ func TestMountConfirmationAnswers(t *testing.T) {
 	}
 }
 
+// The backend asks from the live view (--manual-seed), so the prompt follows
+// the snapshot, same as the mount prompt.
+func TestPendingManualSeedOpensAndClosesWithTheSnapshot(t *testing.T) {
+	model := New(nil)
+	model.width, model.height = 130, 40
+	model.ready = true
+
+	model.snapshot.PendingManualSeedURL = "http://127.0.0.1:54321"
+	model.syncManualSeedPrompt()
+	if model.modal != modalConfirmManualSeed {
+		t.Fatalf("pending manual seed did not raise the prompt: modal=%v", model.modal)
+	}
+	view := ansi.Strip(model.manualSeedView())
+	if !strings.Contains(view, "http://127.0.0.1:54321") {
+		t.Fatalf("prompt does not name the proxy address: %s", view)
+	}
+
+	// Once the backend has the answer it clears, which closes the prompt.
+	model.snapshot.PendingManualSeedURL = ""
+	model.syncManualSeedPrompt()
+	if model.modal != modalNone {
+		t.Fatalf("prompt stayed open after the pending manual seed cleared: %v", model.modal)
+	}
+}
+
+// Either key that reaches the prompt just releases the backend's wait -
+// there is no decline branch, since the feature is already opt-in.
+func TestManualSeedConfirmationSendsCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  tea.KeyMsg
+	}{
+		{"enter", tea.KeyMsg{Type: tea.KeyEnter}},
+		{"escape", tea.KeyMsg{Type: tea.KeyEsc}},
+	} {
+		connection := &recordingConn{}
+		model := New(&Client{conn: connection})
+		model.width, model.height = 130, 40
+		model.snapshot.PendingManualSeedURL = "http://127.0.0.1:54321"
+		model.syncManualSeedPrompt()
+
+		updated, cmd := model.updateModal(tc.key)
+		model = updated.(Model)
+		envelopes := drainCommands(t, cmd, connection)
+
+		if len(envelopes) != 1 || envelopes[0].Type != "scan.confirm_manual_seed" {
+			t.Fatalf("%s: expected one scan.confirm_manual_seed, got %v", tc.name, commandTypes(envelopes))
+		}
+	}
+}
+
 // A prompt that names a target adds it and launches.
 func TestSetupPromptWithTargetLaunches(t *testing.T) {
 	connection := &recordingConn{}

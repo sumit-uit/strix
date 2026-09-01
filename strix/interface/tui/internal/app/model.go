@@ -63,6 +63,7 @@ const (
 	modalQuit
 	modalStop
 	modalConfirmMount
+	modalConfirmManualSeed
 	modalVulnerability
 )
 
@@ -118,6 +119,7 @@ type Model struct {
 	splashFrame            int
 	sweepFrame             int
 	budgetPauseNotified    bool
+	modelPauseNotified     bool
 	followOutput           bool
 	selection              selectionState
 	toast                  string

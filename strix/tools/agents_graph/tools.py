@@ -12,6 +12,7 @@ from typing import Any, Literal, get_args
 
 from agents import RunContextWrapper, function_tool
 
+from strix.config.settings import DEFAULT_MAX_AGENT_DEPTH, DEFAULT_MAX_TOTAL_AGENTS
 from strix.core.agents import Status, coordinator_from_context
 from strix.core.execution import notify_parent_on_terminal
 from strix.core.hooks import LLM_TURN_KEY
@@ -404,6 +405,44 @@ async def wait_for_agents(  # noqa: PLR0911
     )
 
 
+async def _agent_cap_error(coordinator: Any, parent_id: str) -> str | None:
+    """Hard caps on the agent graph -- see create_agent's docstring for why.
+
+    Both messages are deliberately explicit that "do it yourself" means
+    return to *your own assigned task*, not the sub-step you just tried to
+    delegate. An earlier, vaguer version of this message ("do this task
+    yourself instead of delegating further") was read literally by some
+    agents as an instruction to perform the blocked sub-step (e.g. redo
+    reconnaissance) rather than refocus on their own specialization -- which
+    defeats the point of a specialist agent existing at all.
+    """
+    parent_depth = await coordinator.agent_depth(parent_id)
+    if parent_depth >= DEFAULT_MAX_AGENT_DEPTH:
+        return (
+            f"Agent tree depth limit reached ({DEFAULT_MAX_AGENT_DEPTH} levels "
+            "below root) -- the child you tried to spawn was refused. This does "
+            "NOT mean 'perform that sub-step yourself'; it means abandon the "
+            "delegation and return directly to YOUR OWN assigned task. If the "
+            "sub-step needed prior reconnaissance, that's likely already in your "
+            "inherited context or notes (check list_notes) -- reuse it instead of "
+            "redoing it. Otherwise use send_message_to_agent to hand the sub-step "
+            "to an existing agent."
+        )
+
+    total_agents = await coordinator.total_agent_count()
+    if total_agents >= DEFAULT_MAX_TOTAL_AGENTS:
+        return (
+            f"Scan-wide agent limit reached ({DEFAULT_MAX_TOTAL_AGENTS} agents) "
+            "-- the child you tried to spawn was refused. This does NOT mean "
+            "'perform that sub-step yourself'; it means abandon the delegation "
+            "and return directly to YOUR OWN assigned task. Call view_agent_graph "
+            "and reuse or message an existing agent that already covers the "
+            "sub-step's scope instead."
+        )
+
+    return None
+
+
 @function_tool(timeout=120)
 async def create_agent(
     ctx: RunContextWrapper,
@@ -423,6 +462,16 @@ async def create_agent(
     **Before spawning, call ``view_agent_graph``** to confirm no
     existing agent already covers this scope — duplicate specialists
     waste turns and create coordination headaches.
+
+    **Hard limits, enforced** (spawn is refused past these, not just
+    discouraged): a max agent tree depth below root, and a max number
+    of agents total per scan. Don't re-apply the Discovery → Validation
+    decomposition pattern at every level of the tree — that's what
+    exhausts the limit. Only decompose further when the existing
+    agents at this depth genuinely can't cover the new work; otherwise
+    do it yourself or hand it to an existing agent via
+    ``send_message_to_agent``. A refused spawn returns the exact
+    current limits in its error.
 
     **Specialization principles:**
 
@@ -448,7 +497,13 @@ async def create_agent(
             success looks like, any constraints.
         inherit_context: Default ``True``. The child receives the
             parent's input history as background; only set ``False``
-            when starting a clean-slate task.
+            when starting a clean-slate task. When ``True`` and you've
+            already done reconnaissance, say so explicitly in ``task``
+            (e.g. "recon is already done -- see your inherited history;
+            go straight to X") — a narrow-scope specialist that isn't
+            told this will often re-run subfinder/httpx/katana from
+            scratch instead of trusting what's already in its context,
+            burning turns it needs for its actual specialization.
         skills: List of skill names (e.g. ``["xss", "sql_injection"]``).
             Max 5; prefer 1-3.
     """
@@ -469,6 +524,14 @@ async def create_agent(
                 "success": False,
                 "error": "Scan runner did not provide a child-agent spawner in context",
             },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    cap_error = await _agent_cap_error(coordinator, parent_id)
+    if cap_error:
+        return json.dumps(
+            {"success": False, "error": cap_error, "agent_id": None},
             ensure_ascii=False,
             default=str,
         )

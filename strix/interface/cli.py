@@ -199,7 +199,9 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
                     interactive=bool(getattr(args, "interactive", False)),
                     max_budget_usd=getattr(args, "max_budget_usd", None),
                     max_turns=getattr(args, "max_turns", DEFAULT_MAX_TURNS),
+                    max_runtime=getattr(args, "max_runtime", None),
                     status_sink=_note_startup_phase,
+                    sequential_execution=getattr(args, "sequential_agents", False),
                 )
             finally:
                 stop_updates.set()

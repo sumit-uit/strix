@@ -486,6 +486,10 @@ func (m Model) updateModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			cmd := m.answerMountConfirmation(false)
 			return m, cmd
 		}
+	case modalConfirmManualSeed:
+		if m.centeredLabelHit(view, "Continue", msg.X, msg.Y) {
+			return m, m.answerManualSeedPrompt()
+		}
 	case modalVulnerability:
 		for _, button := range m.reportButtons() {
 			if button == reportCopy || button == reportDone {
@@ -571,6 +575,18 @@ func (m Model) updateModal(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.modal == modalHelp {
 		if key.String() != "" {
 			m.closeModal()
+		}
+		return m, nil
+	}
+	if m.modal == modalConfirmManualSeed {
+		// A single acknowledgement, not a two-choice prompt: there is no
+		// meaningful decline (the feature is already opt-in via --manual-seed),
+		// so either key just releases the backend's wait_for_manual_seed gate.
+		// Closing locally would be undone by the next snapshot anyway, since
+		// PendingManualSeedURL only clears once the backend answer lands.
+		switch key.String() {
+		case "enter", "esc":
+			return m, m.answerManualSeedPrompt()
 		}
 		return m, nil
 	}

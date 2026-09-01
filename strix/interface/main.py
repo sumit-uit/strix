@@ -452,6 +452,9 @@ def main() -> None:
     exit_reason = "user_exit"
     try:
         if args.non_interactive:
+            if getattr(args, "manual_seed", False):
+                logger.warning("--manual-seed requires the interactive TUI; ignoring for this run")
+
             from strix.interface.cli import run_cli
 
             asyncio.run(run_cli(args))

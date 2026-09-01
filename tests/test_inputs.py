@@ -299,6 +299,24 @@ def test_make_model_settings_forces_required_for_anyllm_routed_openai_model() ->
     assert settings.tool_choice == "required"
 
 
+def test_make_model_settings_forces_required_for_auto_routed_model() -> None:
+    """auto/* (OmniRoute-style virtual routing combos) are routed through the
+    OpenAI-compatible provider path (see StrixProvider._resolve_prefixed_model
+    in strix/config/models.py), so tool_choice="required" is valid for them
+    even though the name isn't a known OpenAI model id. Without this, a model
+    behind such routing that occasionally skips native tool calls (writing
+    the call out as text instead) has no way to be forced into always using
+    one.
+    """
+    settings = make_model_settings(
+        None,
+        model_name="auto/best-coding",
+        force_required_tool_choice=True,
+    )
+
+    assert settings.tool_choice == "required"
+
+
 def test_make_model_settings_disables_parallel_tool_calls_by_default() -> None:
     assert make_model_settings("none", model_name="gpt-4o").parallel_tool_calls is False
 

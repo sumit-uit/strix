@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import subprocess
@@ -137,6 +138,13 @@ class ReportState:
         }
         self._run_dir: Path | None = None
         self._saved_vuln_ids: set[str] = set()
+        # Every agent in the scan shares this one ReportState, and dedup
+        # (strix.report.dedupe.check_duplicate) awaits an LLM call in between
+        # reading existing reports and inserting the new one. Without a lock,
+        # two agents filing near-simultaneous reports for the same finding
+        # both read the list before either insert lands, both get
+        # is_duplicate=False, and both get inserted. See dedupe_lock.
+        self.dedupe_lock = asyncio.Lock()
 
         self.caido_url: str | None = None
         self.vulnerability_found_callback: Callable[[dict[str, Any]], None] | None = None
@@ -214,6 +222,35 @@ class ReportState:
                 len(self.vulnerability_reports),
             )
 
+    def _save_screenshots(
+        self,
+        report_id: str,
+        screenshots: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Write already-fetched screenshot bytes to disk; return caption+path refs.
+
+        ``screenshots`` entries are ``{"caption", "filename", "data": bytes}`` --
+        already validated and pulled from the sandbox by
+        ``strix.tools.reporting.tool``. Only the lightweight relative path (not
+        the raw bytes) is kept on the in-memory report dict, so
+        ``vulnerabilities.json``/SARIF stay unaffected in size. The path is
+        relative to ``vulnerabilities/`` (the ``.md`` file's own directory), so
+        it embeds directly with no rewriting at render time.
+        """
+        screenshots_dir = self.get_run_dir() / "vulnerabilities" / report_id / "screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        saved: list[dict[str, str]] = []
+        for shot in screenshots:
+            filename = str(shot["filename"])
+            (screenshots_dir / filename).write_bytes(shot["data"])
+            saved.append(
+                {
+                    "caption": str(shot["caption"]),
+                    "path": f"{report_id}/screenshots/{filename}",
+                },
+            )
+        return saved
+
     def add_vulnerability_report(
         self,
         title: str,
@@ -240,6 +277,7 @@ class ReportState:
         dependency_metadata: dict[str, str] | None = None,
         agent_id: str | None = None,
         agent_name: str | None = None,
+        screenshots: list[dict[str, Any]] | None = None,
     ) -> str:
         report_id = f"vuln-{len(self.vulnerability_reports) + 1:04d}"
 
@@ -293,6 +331,8 @@ class ReportState:
             report["agent_id"] = agent_id
         if agent_name:
             report["agent_name"] = agent_name
+        if screenshots:
+            report["screenshots"] = self._save_screenshots(report_id, screenshots)
 
         self.vulnerability_reports.append(report)
         logger.info(f"Added vulnerability report: {report_id} - {title}")

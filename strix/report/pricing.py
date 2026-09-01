@@ -5,13 +5,13 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, cast
 
+import litellm
+
 
 @lru_cache(maxsize=512)
 def resolve_litellm_model(model: str) -> str | None:
     """Return a provider-qualified model name that LiteLLM can price."""
     try:
-        import litellm
-
         normalized = model.strip()
         for prefix in ("litellm/", "any-llm/", "openai/"):
             if normalized.startswith(prefix):

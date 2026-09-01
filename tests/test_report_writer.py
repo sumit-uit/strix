@@ -113,6 +113,29 @@ def test_render_vulnerability_md_includes_dependency_fields() -> None:
     assert "## Assumptions" in md
 
 
+def test_render_vulnerability_md_includes_screenshots_section() -> None:
+    md = render_vulnerability_md(
+        _sample_report(
+            screenshots=[
+                {"caption": "Before exploitation", "path": "vuln-0001/screenshots/01-before.png"},
+                {"caption": "After exploitation", "path": "vuln-0001/screenshots/02-after.png"},
+            ],
+        ),
+    )
+    assert "## Screenshots" in md
+    assert "**Before exploitation**" in md
+    assert "![Before exploitation](vuln-0001/screenshots/01-before.png)" in md
+    assert "**After exploitation**" in md
+    assert "![After exploitation](vuln-0001/screenshots/02-after.png)" in md
+    # Placed right after Proof of Concept, ahead of Code Analysis.
+    assert md.index("## Screenshots") > md.index("## Description")
+
+
+def test_render_vulnerability_md_omits_screenshots_section_when_absent() -> None:
+    md = render_vulnerability_md(_sample_report())
+    assert "## Screenshots" not in md
+
+
 def test_render_vulnerability_md_poc_code_cannot_break_out_of_fence() -> None:
     # LLM/target-authored PoC content containing its own ``` must not close the
     # fence early and turn the injected markdown into live headings/images.

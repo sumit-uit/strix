@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from agents.agent import Agent
     from agents.items import ModelResponse, TResponseInputItem
 
+    from strix.config.sequential_mode import SequentialLLMGate
+
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +123,7 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         max_budget_usd: float | None = None,
         max_turns: int | None = None,
         interactive: bool = False,
+        llm_gate: SequentialLLMGate | None = None,
     ) -> None:
         if max_budget_usd is not None and (
             not math.isfinite(max_budget_usd) or max_budget_usd <= 0
@@ -133,6 +136,10 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         self._budget_increment = max_budget_usd
         self._max_turns = max_turns
         self._interactive = interactive
+        # --sequential-agents: serializes actual model requests across every
+        # agent in the scan. See strix.config.sequential_mode for why this is
+        # scoped to on_llm_start/on_llm_end rather than the whole turn loop.
+        self._llm_gate = llm_gate
 
     def extend_budget(self) -> None:
         if self._max_budget_usd is None or self._budget_increment is None:
@@ -146,6 +153,10 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         system_prompt: str | None,  # noqa: ARG002
         input_items: list[TResponseInputItem],
     ) -> None:
+        if self._llm_gate is not None:
+            agent_id = context.context.get("agent_id")
+            if isinstance(agent_id, str):
+                await self._llm_gate.acquire(agent_id)
         context.context[LLM_TURN_KEY] = int(context.context.get(LLM_TURN_KEY, 0)) + 1
         try:
             self._maybe_warn_turns(context, input_items)
@@ -228,6 +239,10 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         agent: Agent[dict[str, Any]],
         response: ModelResponse,
     ) -> None:
+        if self._llm_gate is not None:
+            agent_id = context.context.get("agent_id")
+            if isinstance(agent_id, str):
+                self._llm_gate.release(agent_id)
         report_state = get_global_report_state()
         if report_state is None:
             return

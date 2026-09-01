@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import stat
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -65,6 +66,25 @@ def test_is_verified_fails_closed_when_expiry_absent_or_unparseable() -> None:
     # Garbage expiry likewise requires re-verification.
     auth.write_auth(email="a@b.com", token="t", verified_at="not-a-date")  # nosec B106
     assert auth.is_verified() is False
+
+
+def test_skip_email_gate_setting_bypasses_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No record at all -- ordinarily unverified.
+    assert auth.read_auth() is None
+    assert auth.is_verified() is False
+
+    settings = SimpleNamespace(viewer=SimpleNamespace(skip_email_gate=True))
+    monkeypatch.setattr(auth, "load_settings", lambda: settings)
+    assert auth.is_verified() is True
+
+    # It never touches the stored record: turning the setting back off falls
+    # straight back to the real (still-absent) verification state.
+    unverified_settings = SimpleNamespace(viewer=SimpleNamespace(skip_email_gate=False))
+    monkeypatch.setattr(auth, "load_settings", lambda: unverified_settings)
+    assert auth.is_verified() is False
+    assert auth.read_auth() is None
 
 
 def test_is_verified_accepts_epoch_expiry() -> None:

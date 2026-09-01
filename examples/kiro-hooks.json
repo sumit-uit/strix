@@ -1,0 +1,121 @@
+{
+  "hooks": [
+    {
+      "name": "Quick Security Scan on Save",
+      "version": "1.0.0",
+      "description": "Run a quick Strix security scan when Python, JavaScript, or TypeScript files are saved",
+      "when": {
+        "type": "fileEdited",
+        "patterns": ["*.py", "*.js", "*.ts", "*.jsx", "*.tsx"]
+      },
+      "then": {
+        "type": "askAgent",
+        "prompt": "A file was just modified. Run a quick Strix security scan (strix -n -t ./ --scan-mode quick --max-budget 3) to check for vulnerabilities introduced by this change. If vulnerabilities are found, summarize them and suggest fixes."
+      }
+    },
+    {
+      "name": "Post-Task Security Validation",
+      "version": "1.0.0",
+      "description": "Automatically run security tests after completing a development task",
+      "when": {
+        "type": "postTaskExecution"
+      },
+      "then": {
+        "type": "runCommand",
+        "command": "strix -n -t ./ --scan-mode quick --max-budget 5",
+        "timeout": 600
+      }
+    },
+    {
+      "name": "Pre-Commit Security Gate",
+      "version": "1.0.0",
+      "description": "Manual trigger to run security checks before committing code",
+      "when": {
+        "type": "userTriggered"
+      },
+      "then": {
+        "type": "runCommand",
+        "command": "strix -n -t ./ --scan-mode quick --max-budget 3",
+        "timeout": 300
+      }
+    },
+    {
+      "name": "Security Review Before PR",
+      "version": "1.0.0",
+      "description": "Run comprehensive security scan before creating pull requests",
+      "when": {
+        "type": "userTriggered"
+      },
+      "then": {
+        "type": "runCommand",
+        "command": "strix -n -t ./ --scan-mode standard --max-budget 15",
+        "timeout": 1800
+      }
+    },
+    {
+      "name": "API Endpoint Security Check",
+      "version": "1.0.0",
+      "description": "Scan API routes and controllers for security vulnerabilities",
+      "when": {
+        "type": "fileEdited",
+        "patterns": ["**/routes/*.py", "**/api/*.js", "**/controllers/*.ts", "**/endpoints/*.py"]
+      },
+      "then": {
+        "type": "askAgent",
+        "prompt": "An API endpoint file was modified. Run Strix with focus on API security (strix -n -t ./ --instruction 'Focus on API security: broken authentication, excessive data exposure, injection, broken access control' --max-budget 5). Report any findings."
+      }
+    },
+    {
+      "name": "Authentication Code Review",
+      "version": "1.0.0",
+      "description": "Deep security scan when authentication/authorization code changes",
+      "when": {
+        "type": "fileEdited",
+        "patterns": ["**/auth/*.py", "**/authentication/*.js", "**/middleware/auth*.ts", "**/security/*.py"]
+      },
+      "then": {
+        "type": "askAgent",
+        "prompt": "Authentication or authorization code was modified. This is critical. Run a focused Strix scan (strix -n -t ./ --instruction 'Focus on authentication bypass, session management, privilege escalation, and access control flaws' --max-budget 10). Review findings carefully."
+      }
+    },
+    {
+      "name": "Database Query Security",
+      "version": "1.0.0",
+      "description": "Check for SQL/NoSQL injection when database code changes",
+      "when": {
+        "type": "fileEdited",
+        "patterns": ["**/models/*.py", "**/database/*.js", "**/queries/*.ts", "**/sql/*.py"]
+      },
+      "then": {
+        "type": "askAgent",
+        "prompt": "Database query code was modified. Run Strix with injection focus (strix -n -t ./ --instruction 'Focus exclusively on SQL injection, NoSQL injection, and ORM security issues' --max-budget 5)."
+      }
+    },
+    {
+      "name": "Weekly Deep Security Audit",
+      "version": "1.0.0",
+      "description": "Comprehensive weekly security audit (trigger manually or via cron)",
+      "when": {
+        "type": "userTriggered"
+      },
+      "then": {
+        "type": "runCommand",
+        "command": "strix -n -t ./ --scan-mode deep --max-budget 50",
+        "timeout": 7200
+      }
+    },
+    {
+      "name": "Review Security Tool Output",
+      "version": "1.0.0",
+      "description": "Review and summarize Strix scan results after completion",
+      "when": {
+        "type": "postToolUse",
+        "toolTypes": "shell"
+      },
+      "then": {
+        "type": "askAgent",
+        "prompt": "A command was just executed. If it was a Strix scan, check the results in strix_runs/ and provide a summary of findings, their severity, and recommended next steps."
+      }
+    }
+  ]
+}

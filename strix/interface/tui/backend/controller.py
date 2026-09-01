@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from strix.report.state import ReportState
 
 
-_STOPPABLE_AGENT_STATUSES = frozenset({"running", "waiting", "budget_paused"})
+_STOPPABLE_AGENT_STATUSES = frozenset({"running", "waiting", "budget_paused", "model_paused"})
 
 ChangeCallback = Callable[[], None]
 StartCallback = Callable[[bool], Awaitable[None]]
@@ -100,6 +100,10 @@ class TuiController:
         # anything is prepared; this holds the directory awaiting that answer.
         self.pending_workspace_mount: str | None = None
         self._pending_verify = True
+        # Set while --manual-seed is holding scan startup open, waiting for the
+        # user to confirm they're done browsing the target through Caido.
+        self.pending_manual_seed_url: str | None = None
+        self._manual_seed_event: asyncio.Event | None = None
         self.messages: list[dict[str, str]] = []
         self._next_message_id = 1
         self.error: str | None = None
@@ -179,6 +183,7 @@ class TuiController:
             "target_count": len(self.targets),
             "working_dir": str(Path.cwd()),
             "pending_mount": self.pending_workspace_mount or "",
+            "pending_manual_seed_url": self.pending_manual_seed_url or "",
             "instruction": terminal_projection(self.instruction, max_string=2 * 1024),
             "scan_mode": self.scan_mode,
             "max_budget_usd": self.max_budget_usd,
@@ -267,6 +272,7 @@ class TuiController:
             "setup.set_instruction": self._set_instruction,
             "setup.start": self._start,
             "setup.confirm_mount": self._confirm_mount,
+            "scan.confirm_manual_seed": self._confirm_manual_seed,
             "agent.send_message": self._send_message,
             "agent.stop": self._stop_agent,
             "viewer.open": self._open_viewer,
@@ -355,6 +361,27 @@ class TuiController:
         self.workspace_mount = mount if approved else None
         await self._begin_scan(self._pending_verify)
         return {"approved": approved}
+
+    async def wait_for_manual_seed(self, proxy_url: str) -> None:
+        """Hold scan startup open until the live view confirms manual seeding is done.
+
+        Passed to :func:`strix.core.runner.run_strix_scan` as ``manual_seed_gate``
+        when ``--manual-seed`` is set; it awaits below until
+        :meth:`_confirm_manual_seed` answers the pending prompt it opens here.
+        """
+        self._manual_seed_event = asyncio.Event()
+        self.pending_manual_seed_url = proxy_url
+        self.notify_changed()
+        await self._manual_seed_event.wait()
+        self._manual_seed_event = None
+
+    async def _confirm_manual_seed(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        """Answer the pending manual-seed prompt asked for in the live view."""
+        if self._manual_seed_event is None:
+            raise RuntimeError("No manual-seed confirmation is pending")
+        self.pending_manual_seed_url = None
+        self._manual_seed_event.set()
+        return {}
 
     async def _send_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         agent_id = self._required_string(payload, "agent_id")

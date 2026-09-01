@@ -504,6 +504,106 @@ async def test_snapshot_round_trip_preserves_budget_pause() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pause_for_model_unavailable_sets_flag_and_status() -> None:
+    coordinator = AgentCoordinator()
+    await coordinator.register("root", "strix", parent_id=None)
+
+    await coordinator.pause_for_model_unavailable("root")
+    assert coordinator.model_paused is True
+    assert coordinator.statuses["root"] == "model_paused"
+
+
+@pytest.mark.asyncio
+async def test_resume_from_model_unavailable_nudges_every_paused_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = AgentCoordinator()
+    await coordinator.register("root", "strix", parent_id=None)
+    await coordinator.register("child-a", "recon", parent_id="root")
+    await coordinator.register("child-b", "recon", parent_id="root")
+    await coordinator.pause_for_model_unavailable("root")
+    await coordinator.pause_for_model_unavailable("child-a")
+    await coordinator.pause_for_model_unavailable("child-b")
+
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    async def _record(target_agent_id: str, message: dict[str, Any]) -> bool:
+        sent.append((target_agent_id, message))
+        return True
+
+    monkeypatch.setattr(coordinator, "send", _record)
+
+    await coordinator.resume_from_model_unavailable(exclude="root")
+
+    assert coordinator.model_paused is False
+    assert all(coordinator.statuses[aid] == "waiting" for aid in ("root", "child-a", "child-b"))
+    assert sorted(target for target, _ in sent) == ["child-a", "child-b"]
+    assert all(message["type"] == "model_available" for _, message in sent)
+
+    await coordinator.resume_from_model_unavailable(exclude="root")
+    assert sorted(target for target, _ in sent) == ["child-a", "child-b"]
+
+
+@pytest.mark.asyncio
+async def test_user_send_resumes_model_pause(tmp_path: Any) -> None:
+    coordinator = AgentCoordinator()
+    await coordinator.register("root", "strix", parent_id=None)
+    session = SQLiteSession("root", tmp_path / "agents.db")
+    await coordinator.attach_runtime("root", session=session)
+    await coordinator.pause_for_model_unavailable("root")
+
+    delivered = await coordinator.send("root", {"from": "user", "content": "fixed the API key"})
+
+    assert delivered is True
+    assert coordinator.model_paused is False
+    assert coordinator.statuses["root"] == "waiting"
+    assert coordinator.pending_counts["root"] == 1
+    session.close()
+
+
+@pytest.mark.asyncio
+async def test_non_user_send_does_not_resume_model_pause(tmp_path: Any) -> None:
+    coordinator = AgentCoordinator()
+    await coordinator.register("root", "strix", parent_id=None)
+    session = SQLiteSession("root", tmp_path / "agents.db")
+    await coordinator.attach_runtime("root", session=session)
+    await coordinator.pause_for_model_unavailable("root")
+
+    await coordinator.send("root", {"from": "system", "content": "status"})
+
+    assert coordinator.model_paused is True
+    assert coordinator.statuses["root"] == "model_paused"
+    session.close()
+
+
+@pytest.mark.asyncio
+async def test_clear_model_paused_normalizes_statuses_on_resume() -> None:
+    coordinator = AgentCoordinator()
+    await coordinator.register("root", "strix", parent_id=None)
+    await coordinator.pause_for_model_unavailable("root")
+
+    await coordinator.clear_model_paused()
+
+    assert coordinator.model_paused is False
+    assert coordinator.statuses["root"] == "waiting"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_round_trip_preserves_model_pause() -> None:
+    coordinator = AgentCoordinator()
+    await coordinator.register("root", "strix", parent_id=None)
+    await coordinator.pause_for_model_unavailable("root")
+
+    snap = await coordinator.snapshot()
+    assert snap["model_paused"] is True
+
+    restored = AgentCoordinator()
+    await restored.restore(snap)
+    assert restored.model_paused is True
+    assert restored.statuses["root"] == "model_paused"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["completed", "stopped", "failed", "crashed"])
 async def test_terminal_child_wakes_parked_parent(tmp_path: Any, status: str) -> None:
     # Regression for #870 and #947: a child reaching any terminal state - including a

@@ -22,7 +22,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-Status = Literal["running", "waiting", "completed", "stopped", "crashed", "failed", "budget_paused"]
+Status = Literal[
+    "running",
+    "waiting",
+    "completed",
+    "stopped",
+    "crashed",
+    "failed",
+    "budget_paused",
+    "model_paused",
+]
 
 # Why an agent parked. The user can message any agent, so this - not the agent's
 # position in the tree - decides whether waiting is bounded: only an agent waiting
@@ -62,6 +71,7 @@ class AgentCoordinator:
         self._budget_stopped = False
         self._reserve_stopped = False
         self._budget_paused = False
+        self._model_paused = False
         self._extend_budget: Callable[[], None] | None = None
 
     def set_snapshot_path(self, path: Path) -> None:
@@ -88,6 +98,10 @@ class AgentCoordinator:
     @property
     def budget_paused(self) -> bool:
         return self._budget_paused
+
+    @property
+    def model_paused(self) -> bool:
+        return self._model_paused
 
     def set_budget_extender(self, extend: Callable[[], None]) -> None:
         self._extend_budget = extend
@@ -119,6 +133,56 @@ class AgentCoordinator:
                         ),
                     },
                 )
+
+    async def pause_for_model_unavailable(self, agent_id: str) -> None:
+        """Park one agent on a persistent model/quota-unavailable error.
+
+        Scoped per agent, not scan-wide like ``pause_for_budget`` -- each agent
+        discovers the outage independently on its own next model call, so
+        there's nothing to coordinate up front. ``_model_paused`` only tracks
+        whether *any* agent is currently paused this way, so a user message
+        anywhere knows to sweep all of them back to ``waiting``.
+        """
+        async with self._lock:
+            self._model_paused = True
+        await self.set_status(agent_id, "model_paused")
+
+    async def resume_from_model_unavailable(self, *, exclude: str | None = None) -> None:
+        async with self._lock:
+            if not self._model_paused:
+                return
+            self._model_paused = False
+            paused = [aid for aid, status in self.statuses.items() if status == "model_paused"]
+        for aid in paused:
+            await self.set_status(aid, "waiting")
+            if aid != exclude:
+                await self.send(
+                    aid,
+                    {
+                        "from": "system",
+                        "type": "model_available",
+                        "content": (
+                            "[Model] The user says the model/API availability issue is "
+                            "resolved — retry your last action."
+                        ),
+                    },
+                )
+
+    async def clear_model_paused(self) -> None:
+        """Drop any ``model_paused`` state carried into a ``--resume``.
+
+        A resume is itself the user retrying, so there's no reason to hold
+        agents paused across it the way a still-active budget pause is
+        preserved — if the outage is still ongoing, the next model call just
+        pauses them again.
+        """
+        async with self._lock:
+            if not self._model_paused:
+                return
+            self._model_paused = False
+            paused = [aid for aid, status in self.statuses.items() if status == "model_paused"]
+            for aid in paused:
+                self.statuses[aid] = "waiting"
 
     async def reset_budget_stops(
         self,
@@ -167,6 +231,29 @@ class AgentCoordinator:
             self.runtimes.setdefault(agent_id, AgentRuntime())
         logger.info("agent.register %s (%s) parent=%s", agent_id, name, parent_id or "-")
         await self._maybe_snapshot()
+
+    async def agent_depth(self, agent_id: str) -> int:
+        """Hops from ``agent_id`` up to the root (root itself is depth 0).
+
+        Walks parents, not ``agent_id`` itself: an earlier version started
+        the walk on ``agent_id`` and checked membership in ``parent_of``
+        before stepping, which counted the root's own (parent-less) entry as
+        one hop and made every depth off by one -- root reported 1, not 0.
+        That silently made the create_agent depth cap one level stricter
+        than documented, tripping specialist agents (grandchildren of root)
+        the first time they tried to spawn any helper at all.
+        """
+        async with self._lock:
+            depth = 0
+            current = self.parent_of.get(agent_id)
+            while current is not None:
+                depth += 1
+                current = self.parent_of.get(current)
+            return depth
+
+    async def total_agent_count(self) -> int:
+        async with self._lock:
+            return len(self.parent_of)
 
     async def attach_runtime(
         self,
@@ -282,6 +369,8 @@ class AgentCoordinator:
         from_user = message.get("from") == "user"
         if from_user and self._budget_paused:
             await self.resume_from_budget_pause(exclude=target_agent_id)
+        if from_user and self._model_paused:
+            await self.resume_from_model_unavailable(exclude=target_agent_id)
         async with self._lock:
             if target_agent_id not in self.statuses:
                 logger.debug("agent.send dropped unknown target=%s", target_agent_id)
@@ -483,6 +572,7 @@ class AgentCoordinator:
                 "budget_stopped": self._budget_stopped,
                 "reserve_stopped": self._reserve_stopped,
                 "budget_paused": self._budget_paused,
+                "model_paused": self._model_paused,
             }
 
     async def restore(self, snap: dict[str, Any]) -> None:
@@ -505,6 +595,7 @@ class AgentCoordinator:
             self._budget_stopped = bool(snap.get("budget_stopped", False))
             self._reserve_stopped = bool(snap.get("reserve_stopped", False))
             self._budget_paused = bool(snap.get("budget_paused", False))
+            self._model_paused = bool(snap.get("model_paused", False))
             for aid in self.statuses:
                 self.runtimes.setdefault(aid, AgentRuntime())
 

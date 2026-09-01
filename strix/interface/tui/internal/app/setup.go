@@ -520,3 +520,22 @@ func (m *Model) syncMountPrompt() {
 		m.closeModal()
 	}
 }
+
+// syncManualSeedPrompt raises or clears the --manual-seed prompt to match the
+// backend, which holds scan startup open (after the Caido proxy is up, before
+// any agent is built) until the live view confirms the user is done manually
+// browsing the target through it.
+func (m *Model) syncManualSeedPrompt() {
+	switch {
+	case m.snapshot.PendingManualSeedURL != "" && m.modal != modalConfirmManualSeed:
+		m.openModal(modalConfirmManualSeed)
+	case m.snapshot.PendingManualSeedURL == "" && m.modal == modalConfirmManualSeed:
+		m.closeModal()
+	}
+}
+
+// answerManualSeedPrompt tells the backend the user is done (or is skipping)
+// manual browsing, releasing the gate in wait_for_manual_seed.
+func (m *Model) answerManualSeedPrompt() tea.Cmd {
+	return send(m.client, "scan.confirm_manual_seed", map[string]any{})
+}

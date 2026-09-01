@@ -142,7 +142,7 @@ func (m Model) selectedAgentCanStop() bool {
 		return false
 	}
 	switch m.snapshot.Agents[m.selectedAgent].Status {
-	case "running", "waiting", "budget_paused":
+	case "running", "waiting", "budget_paused", "model_paused":
 		return true
 	default:
 		return false
@@ -153,7 +153,7 @@ func (m Model) agentsView(width, height int) string {
 	// The tree's root ("Agents") is hidden (show_root = False), so no header row
 	// is drawn — only the agent nodes.
 	var lines []string
-	statusIcons := map[string]string{"running": "⚪", "waiting": "⏸", "budget_paused": "⏸", "completed": "🟢", "failed": "🔴", "crashed": "🔴", "stopped": "■"}
+	statusIcons := map[string]string{"running": "⚪", "waiting": "⏸", "budget_paused": "⏸", "model_paused": "⏸", "completed": "🟢", "failed": "🔴", "crashed": "🔴", "stopped": "■"}
 	entries := agentTreeEntries(m.snapshot.Agents, m.collapsedAgents)
 	start := windowStart(m.agentOffset, len(entries), height)
 	end := min(len(entries), start+height)

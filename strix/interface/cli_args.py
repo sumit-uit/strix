@@ -245,6 +245,20 @@ Examples:
     )
 
     parser.add_argument(
+        "--max-runtime",
+        dest="max_runtime",
+        metavar="SECONDS",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Maximum runtime per agent in seconds (> 0). Each agent is force-stopped "
+            "after this duration, wraps up and reports findings, then terminates. "
+            "Useful for preventing stuck agents. "
+            "Default: no time limit (turn-based only)."
+        ),
+    )
+
+    parser.add_argument(
         "--resume",
         type=str,
         metavar="RUN_NAME",
@@ -252,6 +266,28 @@ Examples:
             "Resume a prior scan by its run name (the dir under ./strix_runs/). "
             "Picks up the root + every non-terminal subagent's full LLM history "
             "and agent topology. Skips fresh run-name generation."
+        ),
+    )
+
+    parser.add_argument(
+        "--sequential-agents",
+        action="store_true",
+        help=(
+            "Run agents sequentially instead of in parallel. "
+            "Each child agent completes before the next one spawns. "
+            "Useful for avoiding rate limits or reducing resource usage."
+        ),
+    )
+
+    parser.add_argument(
+        "--manual-seed",
+        dest="manual_seed",
+        action="store_true",
+        help=(
+            "Before agents start, pause and show the Caido proxy address so you can "
+            "point your browser at it and manually log into the target, seeding an "
+            "authenticated session for the agents to reuse. TUI only; ignored with "
+            "--non-interactive."
         ),
     )
 

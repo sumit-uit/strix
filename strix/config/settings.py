@@ -12,6 +12,15 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "
 
 DEFAULT_MAX_TURNS = 500
 
+# Hard caps on the agent graph itself, enforced in create_agent
+# (strix/tools/agents_graph/tools.py). Advisory prompt guidance ("check
+# view_agent_graph before spawning", "avoid duplicate coverage") isn't
+# reliably followed at depth -- nested agents re-apply the same
+# discovery/validator decomposition pattern the root agent uses, which
+# left unchecked produces unbounded, heavily duplicated fan-out.
+DEFAULT_MAX_AGENT_DEPTH = 3
+DEFAULT_MAX_TOTAL_AGENTS = 40
+
 _BASE_CONFIG = SettingsConfigDict(
     case_sensitive=False,
     populate_by_name=True,
@@ -142,6 +151,11 @@ class ViewerSettings(BaseSettings):
     # verification and encrypted report delivery. The browser never talks to
     # the relay directly; the local server is the only caller.
     app_url: str = Field(default="https://app.strix.ai", alias="STRIX_APP_URL")
+
+    # Skips the work-email verification gate on the local run-history list.
+    # Local-only convenience: the report-send flow still requires a real
+    # relay-verified record regardless of this setting (see auth.py).
+    skip_email_gate: bool = Field(default=False, alias="STRIX_VIEWER_SKIP_EMAIL_GATE")
 
 
 class Settings(BaseSettings):

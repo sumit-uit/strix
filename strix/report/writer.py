@@ -265,6 +265,18 @@ def render_vulnerability_md(report: dict[str, Any]) -> str:  # noqa: PLR0912, PL
             lines.append(fence)
             lines.append("")
 
+    if report.get("screenshots"):
+        lines.append("## Screenshots\n")
+        for shot in report["screenshots"]:
+            caption = str(shot.get("caption") or "").strip()
+            path = str(shot.get("path") or "").strip()
+            if not path:
+                continue
+            if caption:
+                lines.append(f"**{caption}**\n")
+            lines.append(f"![{caption}]({path})")
+            lines.append("")
+
     if report.get("code_locations"):
         lines.append("## Code Analysis\n")
         for i, loc in enumerate(report["code_locations"]):

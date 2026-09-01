@@ -88,6 +88,7 @@ class GoTuiRuntime:
             "resume_instruction": self.args.user_explicit_instruction or "",
             "workspace_mount": getattr(self.args, "workspace_mount", None) or "",
             "workspace_subdir": getattr(self.args, "workspace_subdir", None) or "",
+            "sequential_execution": getattr(self.args, "sequential_agents", False),
         }
         self.report_state = ReportState(self.scan_config["run_name"])
         self.report_state.hydrate_from_run_dir()
@@ -184,7 +185,14 @@ class GoTuiRuntime:
                 interactive=True,
                 max_turns=self.args.max_turns,
                 max_budget_usd=self.args.max_budget_usd,
+                max_runtime=getattr(self.args, "max_runtime", None),
                 event_sink=self.capture_event,
+                sequential_execution=getattr(self.args, "sequential_agents", False),
+                manual_seed_gate=(
+                    self.controller.wait_for_manual_seed
+                    if getattr(self.args, "manual_seed", False)
+                    else None
+                ),
             )
             await self._sync_agent_state()
             if self.controller.scan_state == "running":

@@ -207,6 +207,8 @@ func (m Model) modalView() string {
 		return m.confirmView("🛑 Stop '"+name+"'?", 30, mid, mid)
 	case modalConfirmMount:
 		return m.mountConfirmView()
+	case modalConfirmManualSeed:
+		return m.manualSeedView()
 	case modalVulnerability:
 		if len(m.snapshot.Vulnerabilities) == 0 {
 			return ""
@@ -241,6 +243,28 @@ func (m Model) mountConfirmView() string {
 	body := render.Col(white).Render(truncatePath(dir, width-4)) + "\n" +
 		render.Dim().Render("writable in the sandbox · skip to run without it")
 	return m.cornerPrompt(title, body, width, mountConfirmLabel, mountCancelLabel)
+}
+
+// manualSeedView shows the Caido proxy address for --manual-seed: point a
+// browser at it (trusting Caido's certificate for HTTPS interception) and log
+// into the target before continuing, so the agents inherit the session left
+// behind. There is no real decline branch here - the feature is already
+// opt-in via the flag - so this is a single acknowledgement, not a two-button
+// confirm dialog.
+func (m Model) manualSeedView() string {
+	width := min(64, max(40, m.width-4))
+	title := lipgloss.NewStyle().Bold(true).Foreground(amber).Render("⏸ Manual session seeding")
+	proxyLine := render.Bold(white).Render("Proxy: ") + render.Col(white).Render(m.snapshot.PendingManualSeedURL)
+	body := proxyLine + "\n\n" + render.Dim().Render(
+		"Point your browser's proxy at this address and trust Caido's\n"+
+			"certificate for HTTPS interception, then log into the target.\n"+
+			"Agents will reuse whatever session you leave behind.",
+	)
+	action := lipgloss.NewStyle().Bold(true).Background(amber).Foreground(brightWhite).Render(" Continue [enter] ")
+	inner := lipgloss.NewStyle().Width(width - 4)
+	content := inner.Render(title) + "\n\n" + inner.Render(body) + "\n\n" +
+		inner.Align(lipgloss.Right).Render(action)
+	return lipgloss.NewStyle().Width(width - 2).Border(lipgloss.RoundedBorder()).BorderForeground(amber).Background(black).Padding(1).Render(content)
 }
 
 // truncatePath keeps the tail of a path visible, which is the part that

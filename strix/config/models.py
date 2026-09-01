@@ -466,6 +466,12 @@ class StrixProvider(MultiProvider):
             )
         if prefix == "ollama" and stripped_model_name:
             return self._get_fallback_provider("litellm"), f"ollama_chat/{stripped_model_name}"
+        # OmniRoute's auto/* combos (auto/best-coding, auto/cheap, etc.) are virtual models
+        # that only exist within OmniRoute's routing layer. When using a custom api_base
+        # (e.g., pointing to OmniRoute), route these through the OpenAI provider so the
+        # model name is passed through as-is to the OpenAI-compatible endpoint.
+        if prefix == "auto":
+            return self._get_fallback_provider("openai"), original_model_name
         return self._get_fallback_provider("litellm"), original_model_name
 
     def get_model(self, model_name: str | None) -> Model:
