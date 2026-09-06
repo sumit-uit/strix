@@ -41,6 +41,22 @@ leak the gate's one permit on the first such failure and wedge the whole
 scan. ``run_agent_loop`` (``strix/core/execution.py``) closes that gap with
 an unconditional release in its ``finally``, covering the entire life of
 one agent regardless of how many retries or turns it took internally.
+
+Known tradeoff -- prompt-cache TTL: this gate round-robins a single lock
+across every active agent, so the wall-clock gap between one specific
+agent's own successive calls grows with however many other agents are
+queued ahead of it. Strix enables Claude prompt caching by default
+(``STRIX_PROMPT_CACHE``, see ``strix/core/inputs.py``'s
+``cache_control_injection_points``), which needs an agent's calls to land
+within the cache's TTL (a few minutes) to keep hitting. With enough
+concurrent agents, the round-robin gap can exceed that TTL, so an agent's
+next call reprocesses its full system prompt/skills/tool definitions from
+scratch instead of hitting cache -- working against this flag's own
+"lower peak cost" goal even as it achieves "fewer 429s". The gate has no
+cache-TTL awareness today (no priority for an agent close to expiring its
+cache); this is a real scheduling problem, not a bug, and is a candidate
+for a future fairness policy rather than something acquire()/release()
+alone can fix.
 """
 
 from __future__ import annotations

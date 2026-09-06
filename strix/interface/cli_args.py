@@ -273,9 +273,15 @@ Examples:
         "--sequential-agents",
         action="store_true",
         help=(
-            "Run agents sequentially instead of in parallel. "
-            "Each child agent completes before the next one spawns. "
-            "Useful for avoiding rate limits or reducing resource usage."
+            "Serialize outbound model API calls across all agents in the scan "
+            "so only one agent is actually calling the LLM at a time. Child "
+            "agents still spawn and run concurrently (tool calls, waiting, "
+            "recon, etc.) -- this does not make one agent's tree finish before "
+            "the next starts. Useful for avoiding 429s and reducing peak cost, "
+            "not for limiting how many agents run at once. Tradeoff: with many "
+            "concurrent agents, the wait between one agent's own calls can "
+            "exceed the prompt cache TTL, causing cache misses that raise cost "
+            "for that agent (see strix.config.sequential_mode)."
         ),
     )
 

@@ -232,6 +232,19 @@ class StrixDockerSandboxClient(DockerSandboxClient):
         extra_hosts = create_kwargs.setdefault("extra_hosts", {})
         extra_hosts["host.docker.internal"] = "host-gateway"
 
+        # Strix injection: run an init (docker-init/tini) as real PID 1.
+        # Without this, "tail -f /dev/null" (the SDK's keep-alive command
+        # above) IS PID 1, and it never reaps children. Every ``docker
+        # exec``-driven tool call (shell commands, agent-browser's Chrome,
+        # nuclei/subfinder, ...) whose process tree gets orphaned -- a
+        # crashed Chrome renderer, a killed shell whose grandchild outlives
+        # it -- gets re-parented to PID 1 and sits there as a zombie
+        # forever, since nothing ever calls waitpid() on it. Over a
+        # multi-hour scan with many concurrent agents this accumulates into
+        # thousands of defunct processes. `init=True` costs nothing and
+        # fixes this at the source instead of trying to reap from Python.
+        create_kwargs.setdefault("init", True)
+
         _apply_sandbox_network(create_kwargs)
         _apply_resource_limits(create_kwargs)
         _apply_log_limits(create_kwargs)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -224,6 +225,7 @@ async def _fetch_screenshots(
 
     fetched: list[dict[str, Any]] = []
     errors: list[str] = []
+    seen_hashes: dict[str, int] = {}
     for i, shot in enumerate(screenshots):
         path = shot["path"]
         try:
@@ -245,6 +247,23 @@ async def _fetch_screenshots(
         if ext is None:
             errors.append(f"screenshots[{i}]: '{path}' is not a recognized PNG/JPEG image")
             continue
+        # Two screenshots meant to prove different moments (e.g. before/after
+        # exploitation) must actually be distinct captures. A byte-identical
+        # pair means one was reused/relabeled rather than freshly taken, and
+        # proves nothing about the second claimed state.
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest in seen_hashes:
+            other = seen_hashes[digest]
+            errors.append(
+                f"screenshots[{i}] ('{shot['caption']}') is byte-identical to "
+                f"screenshots[{other}] ('{screenshots[other]['caption']}') — "
+                "each screenshot must be a fresh capture of a genuinely "
+                "different state, not the same file reused with a new "
+                "caption. Re-capture the actual state this screenshot claims "
+                "to show."
+            )
+            continue
+        seen_hashes[digest] = i
         filename = f"{i + 1:02d}-{_slugify_caption(shot['caption'])}.{ext}"
         fetched.append({"caption": shot["caption"], "filename": filename, "data": payload})
     return fetched, errors
@@ -527,6 +546,112 @@ async def create_vulnerability_report(
       consequence. When evidence is incomplete, lower the metric or
       continue validation; never choose a higher value "to be safe."
 
+    **Bug-bounty submission bar** — apply this the moment you first suspect
+    a finding falls into an excluded category below, not just right before
+    calling this tool. Ask whether it would survive triage on a real
+    program (HackerOne / Bugcrowd / YesWeHack / Intigriti); if it would
+    bounce as Informative / Not Applicable / Needs More Info there, do not
+    file it here — and just as importantly, stop investing further turns in
+    it. Do not deepen an excluded-category finding into a bigger writeup
+    (more requests, more evidence, more variants), and do not go hunting for
+    the same excluded pattern on other endpoints once you've confirmed it
+    once — that is exploration effort a filable finding could have used. If
+    it might still feed a DIFFERENT, filable finding later (e.g. an
+    enumeration oracle that speeds up a credential-stuffing chain you are
+    actually going to demonstrate), jot one line with ``create_note`` and
+    move your attention to untested surface — do not build it into a report
+    of its own:
+
+    - **Do not file, absent a demonstrated chained consequence**: missing
+      security headers (CSP/HSTS/X-Frame-Options) alone; verbose error
+      messages or stack traces alone; self-XSS (only the victim attacking
+      themselves can trigger it); clickjacking without a concrete sensitive
+      state-changing action actually framed and triggered; software/
+      version/banner disclosure; absence of rate limiting alone; weak
+      TLS/cipher-suite/protocol configuration; CSRF on a read-only endpoint
+      or one already protected by a validated token/``SameSite`` cookie;
+      open redirect with no demonstrated follow-on (token theft, auth
+      bypass, OAuth flow hijack); host-header trust with no demonstrated
+      consequence (a poisoned password-reset link, cache poisoning);
+      autocomplete/cacheable-page hygiene; HTTP verb/``OPTIONS``
+      enumeration; directory listing of only already-public assets;
+      **username/email/account enumeration** — any oracle (a
+      ``{"exists": true/false}``-style API, a differential error message
+      such as "no account found" vs "wrong password", response
+      size/timing differences, or a distinct HTTP status) that only
+      discloses *whether* a username/email/account exists, with no further
+      demonstrated consequence; password-complexity/policy disclosure.
+      Enumeration is near-universally excluded by name on bounty programs
+      (HackerOne, Bugcrowd, YesWeHack, Intigriti policies routinely list it
+      verbatim) — do not file it on its own. Only file an enumeration
+      oracle when the SAME report demonstrates it enables something beyond
+      existence disclosure (e.g., it is the missing piece that makes a
+      credential-stuffing/account-takeover chain concretely faster/cheaper
+      AND you demonstrate that chain, or it leaks more than a boolean —
+      e.g., the account's name/plan/internal ID). These are routine
+      Informative closes on every major platform — do not spend a report
+      on them unless the PoC chains them into an actual unauthorized
+      outcome.
+    - **Program-supplied scope overrides everything above.** When the scan
+      target/instructions include a bug-bounty program's own scope or
+      out-of-scope policy text, every item it excludes is a hard
+      constraint on top of (never instead of) this list — check each
+      candidate finding against that policy before filing, even if this
+      list would otherwise have allowed it (e.g. a program that additionally
+      excludes clickjacking entirely, or excludes a specific subdomain).
+    - **Minimum proof per class — a plausible payload is not evidence**:
+      - *SSRF, blind SQLi, blind XXE, blind command injection*: an
+        out-of-band interaction (interactsh/webhook/DNS canary) must have
+        actually fired, with its hit log (timestamp + unique token) placed
+        in ``evidence``. A payload that "should" trigger a callback is not
+        proof; the received callback is.
+      - *XSS (reflected/stored/DOM)*: proof the script actually executed. Do
+        **NOT** build the PoC around ``alert()`` for the screenshot: the
+        ``agent_browser`` tool auto-accepts ``alert``/``beforeunload``
+        dialogs itself, so the dialog is already gone by the time any
+        screenshot is taken, and a native dialog is generally not part of
+        the page's captured pixels in the first place (true in both headed
+        and headless mode — it is not a headless limitation, so switching
+        modes does not fix it). A screenshot of the page looking normal
+        after an ``alert`` payload is NOT evidence of anything and must not
+        be captioned as one. Use a payload that mutates the visible DOM
+        instead — e.g. inject a distinctly styled, uniquely-texted element
+        (``document.body.insertAdjacentHTML('beforeend', ...)`` with a
+        random marker string and ``document.domain``/``document.cookie``
+        rendered into it) — so the "after" screenshot shows a real,
+        persistent change to the rendered page. Equally valid: a received
+        exfiltration callback (OOB), or the injected script's own
+        ``console.log`` output captured via ``read_console_messages``. If
+        the target's CSP blocks execution, that is a negative result, not
+        something to paper over with a misleading screenshot. You must open
+        every screenshot with ``view_image`` yourself and see the actual
+        DOM change before claiming it as evidence — a screenshot you have
+        not looked at is not verification.
+      - *IDOR / BOLA*: two distinct authenticated identities, with
+        identity A's request actually reading or mutating identity B's
+        resource, and both identities' requests/responses in ``evidence``.
+        Reasoning about a sequential/guessable ID scheme without a second
+        real account and a real cross-account request is not sufficient.
+      - *RCE / command injection*: literal captured output of an executed
+        command (e.g. ``id``/``whoami``/``hostname`` output) from the
+        target process. An error message that merely suggests shell
+        interpretation is not proof of execution.
+      - *Auth bypass / broken access control*: the actual protected
+        resource or action reached while unauthenticated or under the
+        wrong role, with the response body proving access — not that the
+        check "looks missing" in source.
+      - *Race conditions*: the actual duplicated effect captured (balance
+        not decremented twice, coupon redeemed N times, etc.), not just
+        that concurrent requests were sent.
+    - **Evidence must be a captured artifact, not a narration.** Every
+      ``evidence`` block must be the literal output of something you
+      actually ran this scan — a ``proxy`` ``view_request`` capture, raw
+      shell/tool stdout, a browser screenshot, or an OOB hit log — never a
+      cleaned-up or "expected" rewrite of what the PoC should produce. If
+      you have not actually executed ``poc_script_code`` (or the equivalent
+      manual steps) against the live target this session and captured its
+      real output, you are not ready to file.
+
     Automatic LLM-based **deduplication** rejects reports that describe
     the same root cause on the same asset as an existing report. If you
     get a ``duplicate_of`` response, do NOT retry — move on to other
@@ -570,13 +695,33 @@ async def create_vulnerability_report(
     - For any finding with a browser/UI-visible consequence, attach a
       **before** screenshot (baseline, unexploited state) and an
       **after** screenshot (the state that proves the exploit succeeded
-      — an alert fired, unauthorized data/panel visible, a value
-      changed, etc.) via the ``screenshots`` arg. Take them with
+      — an injected/mutated DOM element, unauthorized data/panel visible,
+      a value changed, etc.) via the ``screenshots`` arg. Take them with
       ``agent-browser screenshot`` (see the ``agent_browser`` skill),
       then pass their sandbox paths here — do not just describe what a
       screenshot would show. This does not apply to findings with no
       meaningful visual state (e.g. a pure backend/dependency issue) —
       use judgment, it is not required for every report.
+    - **If you captured screenshots while investigating this finding, they
+      go in this report — do not leave them sitting in the sandbox
+      workspace for someone to dig up later.** A report that narrates "a
+      screenshot confirmed X" without that screenshot attached via
+      ``screenshots`` is incomplete; the whole point of this argument is
+      that the human triager should not have to go find the evidence
+      themselves. Attach every screenshot that actually supports this
+      specific finding at filing time.
+    - **Inspect every screenshot with ``view_image`` before attaching it —
+      do not attach one you have not personally looked at.** Confirm the
+      image actually shows the specific state its caption claims, not just
+      "a page loaded." For an XSS finding specifically, the "after"
+      screenshot must show an injected/mutated DOM element or a received
+      exfiltration callback (see the XSS proof rule above — never a
+      dialog) — a screenshot of the page rendering normally (e.g. a login
+      form, a search results page) proves nothing and must not be used as
+      XSS evidence even if it was taken right after sending the payload.
+      Take a fresh screenshot immediately at each claimed moment; never
+      reuse an earlier screenshot for a later step in the same PoC — this
+      tool rejects byte-identical screenshots passed as separate entries.
     - When a finding was demonstrated via intercepted or replayed HTTP
       traffic, ``evidence`` MUST include the full raw request **and**
       response (method, path, headers, body) exactly as returned by the
@@ -701,9 +846,14 @@ async def create_vulnerability_report(
         poc_description: Step-by-step reproduction (steps only, no code).
         poc_script_code: Working PoC (Python preferred).
         remediation_steps: Specific, actionable fix (prose, no code).
-        evidence: Concrete proof the issue is real and exploitable —
-            request/response excerpts, observed behavior, tool output.
-            Use fenced code blocks; no internal identifiers/paths.
+        evidence: Concrete proof the issue is real and exploitable — the
+            literal captured output of something you actually ran this
+            scan (request/response excerpts, OOB callback hit log,
+            command stdout, screenshot), never a narrated or "expected"
+            rewrite of what the PoC should produce. See the bug-bounty
+            submission bar above for the minimum proof required per
+            vulnerability class. Use fenced code blocks; no internal
+            identifiers/paths.
         assumptions: Short note on the assumptions/prerequisites that
             make this finding impactful or exploitable (e.g. "assumes an
             authenticated low-privilege user").
