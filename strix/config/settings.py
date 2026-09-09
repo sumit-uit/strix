@@ -21,6 +21,14 @@ DEFAULT_MAX_TURNS = 500
 DEFAULT_MAX_AGENT_DEPTH = 3
 DEFAULT_MAX_TOTAL_AGENTS = 40
 
+# Rolling cap on agents in "running"/"waiting" status at once (not cumulative
+# like DEFAULT_MAX_TOTAL_AGENTS -- an agent leaving that status frees a slot
+# immediately). Exists to bound peak concurrent LLM-call pressure against a
+# slow or single-slot backend; unlike the depth/total caps this is transient,
+# so its refusal message tells the caller to retry shortly rather than
+# abandon the delegation.
+DEFAULT_MAX_CONCURRENT_AGENTS = 3
+
 _BASE_CONFIG = SettingsConfigDict(
     case_sensitive=False,
     populate_by_name=True,

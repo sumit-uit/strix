@@ -255,6 +255,14 @@ class AgentCoordinator:
         async with self._lock:
             return len(self.parent_of)
 
+    async def active_agent_count(self) -> int:
+        """Agents currently in "running"/"waiting" status -- a rolling count,
+        unlike ``total_agent_count``: an agent leaving either status frees a
+        slot immediately, so this reflects live concurrency, not lifetime
+        spawns."""
+        async with self._lock:
+            return sum(1 for status in self.statuses.values() if status in {"running", "waiting"})
+
     async def attach_runtime(
         self,
         agent_id: str,

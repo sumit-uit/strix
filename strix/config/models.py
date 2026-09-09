@@ -852,7 +852,14 @@ def is_known_openai_bare_model(model_name: str) -> bool:
 
 
 def is_claude_model(model_name: str) -> bool:
-    return "claude" in (model_name or "").strip().lower()
+    name = (model_name or "").strip().lower()
+    # "openai/"-prefixed routes are always a generic OpenAI-compatible endpoint
+    # (custom api_base) even when the model id itself contains "claude" - e.g.
+    # a combo/proxy model name. Anthropic-only request params must not be
+    # injected there, so exclude this prefix rather than substring-matching.
+    if name.startswith("openai/"):
+        return False
+    return "claude" in name
 
 
 def is_bedrock_route(model_name: str) -> bool:

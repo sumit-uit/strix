@@ -12,7 +12,11 @@ from typing import Any, Literal, get_args
 
 from agents import RunContextWrapper, function_tool
 
-from strix.config.settings import DEFAULT_MAX_AGENT_DEPTH, DEFAULT_MAX_TOTAL_AGENTS
+from strix.config.settings import (
+    DEFAULT_MAX_AGENT_DEPTH,
+    DEFAULT_MAX_CONCURRENT_AGENTS,
+    DEFAULT_MAX_TOTAL_AGENTS,
+)
 from strix.core.agents import Status, coordinator_from_context
 from strix.core.execution import notify_parent_on_terminal
 from strix.core.hooks import LLM_TURN_KEY
@@ -440,6 +444,17 @@ async def _agent_cap_error(coordinator: Any, parent_id: str) -> str | None:
             "sub-step's scope instead."
         )
 
+    active_agents = await coordinator.active_agent_count()
+    if active_agents >= DEFAULT_MAX_CONCURRENT_AGENTS:
+        return (
+            f"Too many agents running right now ({active_agents}/"
+            f"{DEFAULT_MAX_CONCURRENT_AGENTS} concurrent) -- the child you tried "
+            "to spawn was refused. Unlike the depth/total-agent limits, this is "
+            "transient: an existing agent finishing frees a slot immediately. "
+            "Keep working on your own task and retry this spawn in a bit -- do "
+            "NOT abandon the delegation."
+        )
+
     return None
 
 
@@ -464,14 +479,17 @@ async def create_agent(
     waste turns and create coordination headaches.
 
     **Hard limits, enforced** (spawn is refused past these, not just
-    discouraged): a max agent tree depth below root, and a max number
-    of agents total per scan. Don't re-apply the Discovery → Validation
+    discouraged): a max agent tree depth below root, a max number of
+    agents total per scan, and a max number of agents concurrently
+    running/waiting at once. Don't re-apply the Discovery → Validation
     decomposition pattern at every level of the tree — that's what
     exhausts the limit. Only decompose further when the existing
     agents at this depth genuinely can't cover the new work; otherwise
     do it yourself or hand it to an existing agent via
     ``send_message_to_agent``. A refused spawn returns the exact
-    current limits in its error.
+    current limits in its error. The concurrency limit is transient
+    (an agent finishing frees a slot immediately) — retry the spawn
+    shortly rather than abandoning it, unlike the depth/total caps.
 
     **Specialization principles:**
 
